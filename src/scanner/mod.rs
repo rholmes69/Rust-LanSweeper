@@ -204,9 +204,10 @@ fn finalize(h: &mut HostResult) {
 }
 
 /// Validate targets and register a scan row. Returns the scan id and parsed IP list.
-pub fn prepare_scan(db: &Db, spec: &str, trigger: &str) -> Result<(i64, Vec<IpAddr>)> {
+/// Like `prepare_scan`, recording which site the scan was run for.
+pub fn prepare_site_scan(db: &Db, spec: &str, trigger: &str, site_id: Option<i64>) -> Result<(i64, Vec<IpAddr>)> {
     let ips = targets::parse_targets(spec)?;
-    let id = db.create_scan(spec.trim(), trigger)?;
+    let id = db.create_scan_for_site(spec.trim(), trigger, site_id)?;
     Ok((id, ips))
 }
 
@@ -276,6 +277,7 @@ pub async fn execute_scan(
     }
     let scanned: HashSet<String> = ips.iter().map(|ip| ip.to_string()).collect();
     db.mark_offline(scan_id, &scanned, &seen_ids)?;
+    db.reassign_sites()?; // place new / moved assets into their sites
     db.finish_scan(scan_id, "completed", ips.len(), results.len(), new_assets, None)?;
     progress.finished.store(true, Ordering::Relaxed);
     Ok(())

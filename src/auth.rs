@@ -19,8 +19,17 @@ pub fn hash_token(token: &str) -> String {
     Sha256::digest(token.trim().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Create a named token. Returns (id, plaintext token) — the plaintext is never stored.
-pub fn create(db: &Db, name: &str) -> Result<(i64, String)> {
+/// An authenticated API caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Principal {
+    pub name: String,
+    /// None = all sites; Some(ids) = only these sites.
+    pub sites: Option<Vec<i64>>,
+}
+
+/// Create a named token, optionally limited to some sites.
+/// Returns (id, plaintext token) — the plaintext is never stored.
+pub fn create(db: &Db, name: &str, sites: Option<&[i64]>) -> Result<(i64, String)> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err(anyhow!("token name must be 1–64 characters"));
@@ -28,18 +37,18 @@ pub fn create(db: &Db, name: &str) -> Result<(i64, String)> {
     let token = format!("{TOKEN_PREFIX}{}", random_hex(32)?);
     let prefix: String = token.chars().take(TOKEN_PREFIX.len() + 6).collect();
     let id = db
-        .create_token(name, &hash_token(&token), &prefix)
+        .create_token(name, &hash_token(&token), &prefix, sites)
         .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow!("a token named '{name}' already exists") } else { e })?;
     Ok((id, token))
 }
 
-/// Validate a presented bearer token. Returns the token's name on success.
-pub fn verify(db: &Db, presented: &str) -> Result<Option<String>> {
+/// Validate a presented bearer token.
+pub fn verify(db: &Db, presented: &str) -> Result<Option<Principal>> {
     let t = presented.trim();
     if !t.starts_with(TOKEN_PREFIX) || t.len() != TOKEN_PREFIX.len() + 64 {
         return Ok(None);
     }
-    Ok(db.token_by_hash(&hash_token(t))?.map(|(_, name)| name))
+    Ok(db.token_by_hash(&hash_token(t))?.map(|(_, name, sites)| Principal { name, sites }))
 }
 
 #[cfg(test)]
@@ -49,11 +58,13 @@ mod tests {
     #[test]
     fn create_verify_revoke() {
         let db = Db::open(":memory:").unwrap();
-        let (_, tok) = create(&db, "claude-desktop").unwrap();
+        let (_, tok) = create(&db, "claude-desktop", None).unwrap();
         assert!(tok.starts_with("rsw_") && tok.len() == 68);
-        assert_eq!(verify(&db, &tok).unwrap().as_deref(), Some("claude-desktop"));
+        assert_eq!(verify(&db, &tok).unwrap(), Some(Principal { name: "claude-desktop".into(), sites: None }));
         assert!(verify(&db, "rsw_nope").unwrap().is_none());
-        assert!(create(&db, "claude-desktop").is_err(), "names are unique");
+        assert!(create(&db, "claude-desktop", None).is_err(), "names are unique");
+        let (_, scoped) = create(&db, "dental-only", Some(&[2, 5])).unwrap();
+        assert_eq!(verify(&db, &scoped).unwrap().unwrap().sites, Some(vec![2, 5]));
         let stored = db.list_tokens().unwrap();
         assert!(!stored[0].prefix.is_empty() && stored[0].last_used.is_some());
         assert!(db.revoke_token("claude-desktop").unwrap());

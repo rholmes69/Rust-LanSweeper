@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS mcp_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_at ON mcp_audit(at);
 
+CREATE TABLE IF NOT EXISTS sites (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description  TEXT NOT NULL DEFAULT '',
+    subnets      TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -141,6 +149,10 @@ pub struct Asset {
     pub first_seen: String,
     pub last_seen: String,
     pub open_ports: i64,
+    pub site_id: Option<i64>,
+    pub site: Option<String>,
+    /// True when IT pinned the asset to its site by hand (auto-assignment won't move it).
+    pub site_manual: bool,
 }
 
 impl Asset {
@@ -175,6 +187,7 @@ pub struct Scan {
     pub hosts_up: i64,
     pub new_assets: i64,
     pub error: Option<String>,
+    pub site_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +211,8 @@ pub struct Schedule {
     pub enabled: bool,
     pub last_run: Option<String>,
     pub created_at: String,
+    /// When set, the schedule scans this site's current subnets (targets is informational).
+    pub site_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -208,6 +223,7 @@ pub struct Stats {
     pub new_7d: i64,
     pub by_type: Vec<(String, i64)>,
     pub by_vendor: Vec<(String, i64)>,
+    pub by_site: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +235,8 @@ pub struct ApiToken {
     pub created_at: String,
     pub last_used: Option<String>,
     pub revoked: bool,
+    /// None = all sites; Some(ids) = only these sites.
+    pub sites: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,6 +277,10 @@ pub struct AssetFilter {
     pub sort: Option<String>,
     pub desc: bool,
     pub scan_id: Option<i64>,
+    /// Some(0) = unassigned assets only.
+    pub site_id: Option<i64>,
+    /// Restrict to these sites (site-scoped API tokens). Empty = nothing.
+    pub allowed_sites: Option<Vec<i64>>,
 }
 
 #[derive(Clone)]
@@ -269,7 +291,8 @@ pub struct Db {
 const ASSET_COLS: &str = "a.id, a.ip, a.mac, a.vendor, a.hostname, a.netbios_name, a.netbios_domain, \
     a.os_guess, a.device_type, a.snmp_descr, a.snmp_name, a.snmp_location, a.snmp_contact, \
     a.http_title, a.http_server, a.ssh_banner, a.ttl, a.status, a.notes, a.first_seen, a.last_seen, \
-    (SELECT COUNT(*) FROM ports p WHERE p.asset_id = a.id) AS open_ports";
+    (SELECT COUNT(*) FROM ports p WHERE p.asset_id = a.id) AS open_ports, \
+    a.site_id, (SELECT st.name FROM sites st WHERE st.id = a.site_id), a.site_manual";
 
 fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -295,6 +318,9 @@ fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
         first_seen: r.get(19)?,
         last_seen: r.get(20)?,
         open_ports: r.get(21)?,
+        site_id: r.get(22)?,
+        site: r.get(23)?,
+        site_manual: r.get::<_, i64>(24)? != 0,
     })
 }
 
@@ -310,16 +336,49 @@ fn scan_from_row(r: &Row) -> rusqlite::Result<Scan> {
         hosts_up: r.get(7)?,
         new_assets: r.get(8)?,
         error: r.get(9)?,
+        site_id: r.get(10)?,
     })
 }
 
 const SCAN_COLS: &str =
-    "id, targets, trigger, started_at, finished_at, status, hosts_scanned, hosts_up, new_assets, error";
+    "id, targets, trigger, started_at, finished_at, status, hosts_scanned, hosts_up, new_assets, error, site_id";
+
+/// Columns added after v0.1. `CREATE TABLE IF NOT EXISTS` doesn't alter existing tables,
+/// so older databases get them added here.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("assets", "site_id", "INTEGER REFERENCES sites(id) ON DELETE SET NULL"),
+    ("assets", "site_manual", "INTEGER NOT NULL DEFAULT 0"),
+    ("scans", "site_id", "INTEGER"),
+    ("schedules", "site_id", "INTEGER REFERENCES sites(id) ON DELETE CASCADE"),
+    ("api_tokens", "sites", "TEXT"),
+];
+
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, col, decl) in MIGRATIONS {
+        let exists: bool = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"))?
+            .exists([col])?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_assets_site ON assets(site_id);")?;
+    Ok(())
+}
+
+fn ids_to_text(ids: &[i64]) -> String {
+    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn text_to_ids(s: Option<String>) -> Option<Vec<i64>> {
+    s.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+}
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         // Any scan left "running" from a previous process was interrupted.
         conn.execute(
             "UPDATE scans SET status='interrupted', finished_at=?1 WHERE status='running'",
@@ -368,6 +427,14 @@ impl Db {
             args.push(sid.to_string());
             sql.push_str(&format!(" AND a.last_scan_id = CAST(?{} AS INTEGER)", args.len()));
         }
+        match f.site_id {
+            Some(0) => sql.push_str(" AND a.site_id IS NULL"),
+            Some(id) => sql.push_str(&format!(" AND a.site_id = {id}")),
+            None => {}
+        }
+        if let Some(allowed) = &f.allowed_sites {
+            sql.push_str(&format!(" AND a.site_id IN ({})", if allowed.is_empty() { "NULL".into() } else { ids_to_text(allowed) }));
+        }
         // Whitelisted sort columns only (never interpolate user input directly).
         let order = match f.sort.as_deref() {
             Some("name") => "COALESCE(a.netbios_name, a.hostname, a.ip) COLLATE NOCASE",
@@ -378,6 +445,7 @@ impl Db {
             Some("ports") => "open_ports",
             Some("last_seen") => "a.last_seen",
             Some("status") => "a.status",
+            Some("site") => "(SELECT st.name FROM sites st WHERE st.id = a.site_id) COLLATE NOCASE",
             _ => "a.ip_num",
         };
         let dir = if f.desc { "DESC" } else { "ASC" };
@@ -455,6 +523,9 @@ impl Db {
         };
         s.by_type = group(
             "SELECT COALESCE(device_type,'Unknown'), COUNT(*) c FROM assets GROUP BY 1 ORDER BY c DESC",
+        )?;
+        s.by_site = group(
+            "SELECT COALESCE((SELECT st.name FROM sites st WHERE st.id = a.site_id),'Unassigned'), COUNT(*) c FROM assets a GROUP BY 1 ORDER BY c DESC",
         )?;
         s.by_vendor = group(
             "SELECT COALESCE(vendor,'Unknown'), COUNT(*) c FROM assets GROUP BY 1 ORDER BY c DESC LIMIT 10",
@@ -643,11 +714,11 @@ impl Db {
 
     // ---------------------------------------------------------------- scans
 
-    pub fn create_scan(&self, targets: &str, trigger: &str) -> Result<i64> {
+    pub fn create_scan_for_site(&self, targets: &str, trigger: &str, site_id: Option<i64>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO scans (targets, trigger, started_at) VALUES (?1, ?2, ?3)",
-            params![targets, trigger, now()],
+            "INSERT INTO scans (targets, trigger, started_at, site_id) VALUES (?1, ?2, ?3, ?4)",
+            params![targets, trigger, now(), site_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -687,7 +758,7 @@ impl Db {
     pub fn list_schedules(&self) -> Result<Vec<Schedule>> {
         let conn = self.lock();
         let mut st = conn.prepare(
-            "SELECT id, name, targets, interval_minutes, enabled, last_run, created_at FROM schedules ORDER BY id",
+            "SELECT id, name, targets, interval_minutes, enabled, last_run, created_at, site_id FROM schedules ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             Ok(Schedule {
@@ -698,16 +769,21 @@ impl Db {
                 enabled: r.get::<_, i64>(4)? != 0,
                 last_run: r.get(5)?,
                 created_at: r.get(6)?,
+                site_id: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn add_schedule(&self, name: &str, targets: &str, interval_minutes: i64) -> Result<i64> {
+        self.add_schedule_for_site(name, targets, interval_minutes, None)
+    }
+
+    pub fn add_schedule_for_site(&self, name: &str, targets: &str, interval_minutes: i64, site_id: Option<i64>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO schedules (name, targets, interval_minutes, created_at) VALUES (?1,?2,?3,?4)",
-            params![name, targets, interval_minutes, now()],
+            "INSERT INTO schedules (name, targets, interval_minutes, created_at, site_id) VALUES (?1,?2,?3,?4,?5)",
+            params![name, targets, interval_minutes, now(), site_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -731,18 +807,18 @@ impl Db {
 
     // ---------------------------------------------------------------- API tokens
 
-    pub fn create_token(&self, name: &str, token_hash: &str, prefix: &str) -> Result<i64> {
+    pub fn create_token(&self, name: &str, token_hash: &str, prefix: &str, sites: Option<&[i64]>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO api_tokens (name, token_hash, prefix, created_at) VALUES (?1,?2,?3,?4)",
-            params![name, token_hash, prefix, now()],
+            "INSERT INTO api_tokens (name, token_hash, prefix, created_at, sites) VALUES (?1,?2,?3,?4,?5)",
+            params![name, token_hash, prefix, now(), sites.map(ids_to_text)],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     pub fn list_tokens(&self) -> Result<Vec<ApiToken>> {
         let conn = self.lock();
-        let mut st = conn.prepare("SELECT id, name, prefix, created_at, last_used, revoked FROM api_tokens ORDER BY id")?;
+        let mut st = conn.prepare("SELECT id, name, prefix, created_at, last_used, revoked, sites FROM api_tokens ORDER BY id")?;
         let rows = st.query_map([], |r| {
             Ok(ApiToken {
                 id: r.get(0)?,
@@ -751,22 +827,23 @@ impl Db {
                 created_at: r.get(3)?,
                 last_used: r.get(4)?,
                 revoked: r.get::<_, i64>(5)? != 0,
+                sites: text_to_ids(r.get(6)?),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Look up an active token by hash; records last use. Returns (id, name).
-    pub fn token_by_hash(&self, token_hash: &str) -> Result<Option<(i64, String)>> {
+    /// Look up an active token by hash; records last use. Returns (id, name, site scope).
+    pub fn token_by_hash(&self, token_hash: &str) -> Result<Option<(i64, String, Option<Vec<i64>>)>> {
         let conn = self.lock();
-        let found: Option<(i64, String)> = conn
+        let found: Option<(i64, String, Option<Vec<i64>>)> = conn
             .query_row(
-                "SELECT id, name FROM api_tokens WHERE token_hash=?1 AND revoked=0",
+                "SELECT id, name, sites FROM api_tokens WHERE token_hash=?1 AND revoked=0",
                 [token_hash],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, text_to_ids(r.get(2)?))),
             )
             .optional()?;
-        if let Some((id, _)) = &found {
+        if let Some((id, _, _)) = &found {
             conn.execute("UPDATE api_tokens SET last_used=?1 WHERE id=?2", params![now(), id])?;
         }
         Ok(found)
@@ -820,4 +897,134 @@ impl Db {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    // ---------------------------------------------------------------- sites
+
+    pub fn list_sites(&self) -> Result<Vec<Site>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT s.id, s.name, s.description, s.subnets, s.created_at, \
+               (SELECT COUNT(*) FROM assets a WHERE a.site_id = s.id), \
+               (SELECT COUNT(*) FROM assets a WHERE a.site_id = s.id AND a.status = 'online') \
+             FROM sites s ORDER BY s.name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(Site {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                subnets: r.get(3)?,
+                created_at: r.get(4)?,
+                asset_count: r.get(5)?,
+                online: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_site(&self, id: i64) -> Result<Option<Site>> {
+        Ok(self.list_sites()?.into_iter().find(|s| s.id == id))
+    }
+
+    /// Find a site by numeric id or (case-insensitive) name.
+    pub fn find_site(&self, id_or_name: &str) -> Result<Option<Site>> {
+        let key = id_or_name.trim();
+        Ok(self
+            .list_sites()?
+            .into_iter()
+            .find(|s| s.id.to_string() == key || s.name.eq_ignore_ascii_case(key)))
+    }
+
+    pub fn unassigned_count(&self) -> Result<i64> {
+        Ok(self.lock().query_row("SELECT COUNT(*) FROM assets WHERE site_id IS NULL", [], |r| r.get(0))?)
+    }
+
+    /// Create a site; subnets must already be validated/normalised. Re-assigns assets.
+    pub fn add_site(&self, name: &str, subnets: &str, description: &str) -> Result<i64> {
+        let id = {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO sites (name, subnets, description, created_at) VALUES (?1,?2,?3,?4)",
+                params![name.trim(), subnets, description.trim(), now()],
+            )
+            .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("a site named '{}' already exists", name.trim()) } else { e.into() })?;
+            conn.last_insert_rowid()
+        };
+        self.reassign_sites()?;
+        Ok(id)
+    }
+
+    pub fn update_site(&self, id: i64, name: &str, subnets: &str, description: &str) -> Result<()> {
+        self.lock()
+            .execute(
+                "UPDATE sites SET name=?1, subnets=?2, description=?3 WHERE id=?4",
+                params![name.trim(), subnets, description.trim(), id],
+            )
+            .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("a site named '{}' already exists", name.trim()) } else { anyhow::Error::from(e) })?;
+        self.reassign_sites()?;
+        Ok(())
+    }
+
+    pub fn delete_site(&self, id: i64) -> Result<()> {
+        {
+            let conn = self.lock();
+            conn.execute("UPDATE assets SET site_id = NULL, site_manual = 0 WHERE site_id = ?1", [id])?;
+            conn.execute("DELETE FROM sites WHERE id = ?1", [id])?;
+        }
+        self.reassign_sites()?;
+        Ok(())
+    }
+
+    /// Recompute automatic site membership for every asset not pinned by hand.
+    /// Returns how many assets changed site.
+    pub fn reassign_sites(&self) -> Result<usize> {
+        let sites: Vec<(i64, Vec<ipnet::Ipv4Net>)> = self
+            .list_sites()?
+            .into_iter()
+            .filter_map(|s| crate::sites::parse_subnets(&s.subnets).ok().map(|n| (s.id, n)))
+            .collect();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let assets: Vec<(i64, String, Option<i64>)> = {
+            let mut st = tx.prepare("SELECT id, ip, site_id FROM assets WHERE site_manual = 0")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let mut changed = 0;
+        for (id, ip, cur) in assets {
+            let want = crate::sites::site_for_ip(&sites, &ip);
+            if want != cur {
+                tx.execute("UPDATE assets SET site_id=?1 WHERE id=?2", params![want, id])?;
+                changed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Pin an asset to a site (Some) or return it to automatic assignment (None).
+    pub fn set_asset_site(&self, asset_id: i64, site_id: Option<i64>) -> Result<()> {
+        match site_id {
+            Some(sid) => {
+                self.lock().execute("UPDATE assets SET site_id=?1, site_manual=1 WHERE id=?2", params![sid, asset_id])?;
+            }
+            None => {
+                self.lock().execute("UPDATE assets SET site_manual=0 WHERE id=?1", [asset_id])?;
+                self.reassign_sites()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Site {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// Normalised, comma-separated CIDRs.
+    pub subnets: String,
+    pub created_at: String,
+    pub asset_count: i64,
+    pub online: i64,
 }

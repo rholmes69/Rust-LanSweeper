@@ -27,6 +27,8 @@ Medical (HL7 2575 / DICOM 104), Apple Device, Raspberry Pi, and virtual machines
 - **Asset list** with search (IP, name, MAC, vendor, OS, port number, service, notes), filters, sorting, CSV export
 - **Asset detail** with identity, open ports + banners, SNMP and web info, editable notes, full change history
 - **Change tracking**: discovered, IP/MAC/hostname/OS/type changes, ports opened/closed, online→offline
+- **Sites**: group assets by location (e.g. each clinic) using the subnets each site owns; scan,
+  schedule, filter, export and query per site, and limit AI/API tokens to specific sites
 - **Scheduled scans** (hourly / daily / weekly …) that run while the server is up
 - **REST API** for scripting and integrations
 - Optional **HTTP basic auth**; listens on localhost only by default
@@ -39,6 +41,15 @@ Requires Rust 1.80+ (`https://rustup.rs`). On Windows, install the MSVC build to
 cargo build --release
 # binary: target/release/rustsweeper(.exe)
 ```
+
+## Sites
+
+A site is a location — typically one clinic or building — defined by the subnets it owns. Assets
+are placed automatically: the site whose subnet most specifically contains the asset's IP wins (so
+`10.10.5.0/24` beats `10.10.0.0/16`). Assets outside every site are **Unassigned**. You can pin an
+individual device to a site from its asset page or with `rustsweeper site assign`; pinned devices
+stay put when subnets change. Each site has a **Scan now** button, and schedules can target a site
+so they always scan its current subnets. Existing databases are upgraded automatically.
 
 ## Usage
 
@@ -61,6 +72,14 @@ rustsweeper assets --search printer
 rustsweeper assets --csv > inventory.csv
 rustsweeper show 10.10.0.25
 rustsweeper scans
+
+# Sites (one per clinic/location)
+rustsweeper site add "Main Clinic" 10.10.0.0/22 --description "1200 Delta Ave"
+rustsweeper site add "Dental" 10.20.0.0/24
+rustsweeper site list
+rustsweeper scan --site "Dental"
+rustsweeper assets --site "Main Clinic"
+rustsweeper site assign 10.10.3.40 Dental      # pin one device; --auto to undo
 
 # Schedules (executed by `serve`)
 rustsweeper schedule add "Main clinic LAN" 10.10.0.0/22 --every 1440
@@ -99,10 +118,10 @@ rustsweeper --db C:\RustSweeper\rustsweeper.db mcp --allow-scans   # also expose
 
 | Tool | Purpose |
 |---|---|
-| `list_sites` | Start here: sites, subnets, asset counts, last scan |
+| `list_sites` | Start here: sites with subnets and asset counts, plus unassigned assets grouped by subnet |
 | `search_datasets` | Discover datasets (`assets`, `ports`, `changes`, `scans`), fields and operators |
 | `search_query_catalog` | 20 pre-built queries (remote access exposure, clear-text protocols, HL7/DICOM, new/offline/stale devices, counts by type/OS/vendor, port changes…); `run_id` executes one |
-| `execute_query` | Structured query: dataset, fields, filters (`eq`, `contains`, `in`, `gte` …, relative times like `now-7d`), sort, `group_by`, limit 1–20 (default 10), offset |
+| `execute_query` | Structured query: dataset, optional `site`, fields, filters (`eq`, `contains`, `in`, `gte` …, relative times like `now-7d`), sort, `group_by`, limit 1–20 (default 10), offset |
 | `get_asset` | One device by id, IP or name: details, ports, recent changes |
 | `asset_history` | Change log for one device |
 | `scan_status` | Status/progress of a scan |
@@ -154,6 +173,9 @@ claude mcp add --transport http rustsweeper http://inventory01:8080/mcp --header
 - Browser requests from foreign origins are rejected (DNS-rebinding protection).
 - Every MCP call (stdio and HTTP) is written to an audit log: who, from where, which tool, the
   arguments, rows returned and duration. See the **AI access** page or `rustsweeper audit`.
+- **Site-scoped tokens**: `rustsweeper token create dental-ai --sites Dental` can only see assets,
+  ports, changes and scans for that site — enforced server-side on every tool, whatever the assistant
+  asks for. Scoped tokens can't start scans.
 - `--mcp-allow-scans` exposes `start_scan`; `--no-mcp` turns the endpoint off; `--mcp-no-auth`
   skips tokens but is only allowed when bound to 127.0.0.1.
 
@@ -166,11 +188,12 @@ third-party AI assistant, check that it's allowed under your organization's AI-u
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/stats` | Totals and breakdowns |
-| GET | `/api/assets?q=&type=&status=&sort=&desc=1` | Asset list |
+| GET | `/api/assets?q=&type=&status=&site=&sort=&desc=1` | Asset list (`site=0` = unassigned) |
 | GET | `/api/assets/{id}` | Asset + ports + change history |
 | GET | `/api/scans` | Scan history |
 | POST | `/api/scans` | Body `{"targets":"10.0.0.0/24"}` → `{"id": n}` |
 | GET | `/api/scans/{id}` | Scan status + live progress |
+| GET | `/api/sites` | Sites with subnets and asset counts |
 | GET | `/api/datasets` | Queryable datasets, fields and operators |
 | POST | `/api/query` | Structured query (same format as the MCP `execute_query` tool; up to 1000 rows) |
 
@@ -210,7 +233,8 @@ src/
     prompts.rs         MCP prompts (IT workflows)
     stdio.rs           stdio transport
     http.rs            Streamable HTTP transport (/mcp), sessions, Origin checks
-  auth.rs              API tokens for /mcp
+  auth.rs              API tokens for /mcp (optionally site-scoped)
+  sites.rs             site subnets and longest-prefix assignment
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

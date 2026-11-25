@@ -39,6 +39,9 @@ pub struct Dataset {
     pub default_fields: &'static [&'static str],
     #[serde(skip)]
     pub default_sort: &'static str,
+    /// Column holding the site id, used for site filters and site-scoped tokens.
+    #[serde(skip)]
+    pub site_col: &'static str,
     pub fields: &'static [Field],
 }
 
@@ -49,6 +52,7 @@ macro_rules! f {
 }
 
 const ASSET_NAME: &str = "COALESCE(a.netbios_name, a.hostname, a.snmp_name, a.ip)";
+const ASSET_SITE: &str = "(SELECT st.name FROM sites st WHERE st.id = a.site_id)";
 
 pub static DATASETS: &[Dataset] = &[
     Dataset {
@@ -57,10 +61,13 @@ pub static DATASETS: &[Dataset] = &[
         from: "assets a",
         default_fields: &["id", "ip", "name", "mac", "vendor", "device_type", "os_guess", "open_ports", "status", "last_seen"],
         default_sort: "a.ip_num",
+        site_col: "a.site_id",
         fields: &[
             f!("id", "a.id", Int, "Asset id"),
             f!("ip", "a.ip", Text, "IPv4 address (sorts numerically)"),
             f!("name", "COALESCE(a.netbios_name, a.hostname, a.snmp_name, a.ip)", Text, "Best display name: NetBIOS, then DNS, then SNMP sysName, then IP"),
+            f!("site", "(SELECT st.name FROM sites st WHERE st.id = a.site_id)", Text, "Site (location) name; empty if unassigned"),
+            f!("site_id", "a.site_id", Int, "Site id"),
             f!("mac", "a.mac", Text, "MAC address AA:BB:CC:DD:EE:FF"),
             f!("vendor", "a.vendor", Text, "Hardware vendor from MAC OUI"),
             f!("hostname", "a.hostname", Text, "Reverse-DNS name"),
@@ -91,10 +98,12 @@ pub static DATASETS: &[Dataset] = &[
         from: "ports p JOIN assets a ON a.id = p.asset_id",
         default_fields: &["asset_id", "asset_name", "ip", "port", "service", "banner"],
         default_sort: "a.ip_num, p.port",
+        site_col: "a.site_id",
         fields: &[
             f!("asset_id", "p.asset_id", Int, "Asset id"),
             f!("asset_name", ASSET_NAME, Text, "Asset display name"),
             f!("ip", "a.ip", Text, "Asset IP"),
+            f!("site", ASSET_SITE, Text, "Asset's site name"),
             f!("port", "p.port", Int, "TCP port number"),
             f!("service", "p.service", Text, "Service name guessed from the port (rdp, smb, http, jetdirect, hl7…)"),
             f!("banner", "p.banner", Text, "Banner or HTTP Server header"),
@@ -109,11 +118,13 @@ pub static DATASETS: &[Dataset] = &[
         from: "changes c JOIN assets a ON a.id = c.asset_id",
         default_fields: &["at", "asset_id", "asset_name", "change", "old_value", "new_value"],
         default_sort: "c.id DESC",
+        site_col: "a.site_id",
         fields: &[
             f!("id", "c.id", Int, "Change id"),
             f!("asset_id", "c.asset_id", Int, "Asset id"),
             f!("asset_name", ASSET_NAME, Text, "Asset display name"),
             f!("ip", "a.ip", Text, "Asset current IP"),
+            f!("site", ASSET_SITE, Text, "Asset's site name"),
             f!("at", "c.at", Time, "When the change was recorded"),
             f!("change", "c.field", Text, "'discovered', 'port opened', 'port closed', 'status', 'ip', 'mac', 'hostname', 'netbios_name', 'os_guess', 'device_type', 'snmp_descr'"),
             f!("old_value", "c.old_value", Text, "Previous value"),
@@ -127,9 +138,11 @@ pub static DATASETS: &[Dataset] = &[
         from: "scans s",
         default_fields: &["id", "targets", "trigger", "status", "hosts_scanned", "hosts_up", "new_assets", "started_at", "finished_at"],
         default_sort: "s.id DESC",
+        site_col: "s.site_id",
         fields: &[
             f!("id", "s.id", Int, "Scan id"),
             f!("targets", "s.targets", Text, "Target specification"),
+            f!("site", "(SELECT st.name FROM sites st WHERE st.id = s.site_id)", Text, "Site scanned, when the scan was started for a site"),
             f!("trigger", "s.trigger", Text, "What started the scan"),
             f!("status", "s.status", Text, "running, completed, failed, interrupted"),
             f!("hosts_scanned", "s.hosts_scanned", Int, "Addresses probed"),
@@ -201,6 +214,47 @@ pub struct Query {
     /// Return counts grouped by this field instead of rows.
     #[serde(default)]
     pub group_by: Option<String>,
+    /// Limit to one site: id, name, or "unassigned".
+    #[serde(default)]
+    pub site: Option<Value>,
+}
+
+/// What the caller may see. Site-scoped API tokens get `Some(ids)`.
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    pub sites: Option<Vec<i64>>,
+}
+
+impl Scope {
+    pub fn all() -> Self {
+        Self { sites: None }
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        self.sites.is_some()
+    }
+
+    pub fn allows(&self, site_id: Option<i64>) -> bool {
+        match &self.sites {
+            None => true,
+            Some(ids) => site_id.is_some_and(|s| ids.contains(&s)),
+        }
+    }
+}
+
+/// Resolve a site reference (id, name or "unassigned") to Some(id) / None (= unassigned).
+pub fn resolve_site(db: &Db, v: &Value) -> Result<Option<i64>> {
+    let key = match v {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.trim().to_string(),
+        other => bail!("site must be an id or name, got {other}"),
+    };
+    if key == "0" || key.eq_ignore_ascii_case("unassigned") {
+        return Ok(None);
+    }
+    db.find_site(&key)?
+        .map(|s| Some(s.id))
+        .ok_or_else(|| anyhow!("unknown site '{key}' (use list_sites to see site names)"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -335,7 +389,7 @@ fn json_of(v: ValueRef) -> Value {
 }
 
 /// Execute a structured query and return a JSON result envelope.
-pub fn execute(db: &Db, q: &Query, limits: Limits) -> Result<Value> {
+pub fn execute(db: &Db, q: &Query, limits: Limits, scope: &Scope) -> Result<Value> {
     let ds = dataset(&q.dataset)?;
     let mut params: Vec<SqlValue> = Vec::new();
     let mut clauses = Vec::new();
@@ -343,11 +397,32 @@ pub fn execute(db: &Db, q: &Query, limits: Limits) -> Result<Value> {
         let field = ds.field(&f.field)?;
         clauses.push(build_filter(field, f, &mut params)?);
     }
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(if q.match_any { " OR " } else { " AND " }))
-    };
+    let mut where_parts = Vec::new();
+    if !clauses.is_empty() {
+        where_parts.push(format!("({})", clauses.join(if q.match_any { " OR " } else { " AND " })));
+    }
+    if let Some(site) = &q.site {
+        match resolve_site(db, site)? {
+            Some(id) => {
+                if !scope.allows(Some(id)) {
+                    bail!("this token does not have access to that site");
+                }
+                where_parts.push(format!("{} = {id}", ds.site_col));
+            }
+            None => {
+                if scope.is_restricted() {
+                    bail!("this token does not have access to unassigned assets");
+                }
+                where_parts.push(format!("{} IS NULL", ds.site_col));
+            }
+        }
+    }
+    // Site-scoped tokens: enforced server-side on every query (ids are integers from the DB).
+    if let Some(ids) = &scope.sites {
+        let list = if ids.is_empty() { "NULL".to_string() } else { ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",") };
+        where_parts.push(format!("{} IN ({list})", ds.site_col));
+    }
+    let where_sql = if where_parts.is_empty() { String::new() } else { format!(" WHERE {}", where_parts.join(" AND ")) };
     let limit = q.limit.unwrap_or(limits.default).clamp(1, limits.max);
     let offset = q.offset.unwrap_or(0).max(0);
 
