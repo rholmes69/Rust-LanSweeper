@@ -78,6 +78,61 @@ Useful scan flags (work with both `serve` and `scan`):
 For full MAC-vendor coverage, download `https://standards-oui.ieee.org/oui/oui.csv` and pass
 `--oui-file oui.csv`.
 
+## AI assistants (MCP server)
+
+RustSweeper includes a read-only [Model Context Protocol](https://modelcontextprotocol.io) server, so
+assistants like Claude Desktop, Claude Code and Cursor can answer questions such as *"which devices
+expose RDP?"*, *"what's new on the network this week?"* or *"summarise our printers"* straight from
+the inventory. It follows the same design as Lansweeper's MCP server: discover sites and fields, pick a
+pre-built query or build a structured one, get capped, pageable results. No SQL is ever accepted.
+
+```sh
+rustsweeper --db C:\RustSweeper\rustsweeper.db mcp            # read-only
+rustsweeper --db C:\RustSweeper\rustsweeper.db mcp --allow-scans   # also expose start_scan
+```
+
+**Tools**
+
+| Tool | Purpose |
+|---|---|
+| `list_sites` | Start here: sites, subnets, asset counts, last scan |
+| `search_datasets` | Discover datasets (`assets`, `ports`, `changes`, `scans`), fields and operators |
+| `search_query_catalog` | 20 pre-built queries (remote access exposure, clear-text protocols, HL7/DICOM, new/offline/stale devices, counts by type/OS/vendor, port changes…); `run_id` executes one |
+| `execute_query` | Structured query: dataset, fields, filters (`eq`, `contains`, `in`, `gte` …, relative times like `now-7d`), sort, `group_by`, limit 1–20 (default 10), offset |
+| `get_asset` | One device by id, IP or name: details, ports, recent changes |
+| `asset_history` | Change log for one device |
+| `scan_status` | Status/progress of a scan |
+| `docs` | Searches this documentation |
+| `start_scan` | Only with `--allow-scans` |
+
+**Prompts:** `security-exposure-review`, `new-device-review`, `weekly-inventory-summary`,
+`offline-device-check`, `asset-lookup`.
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "rustsweeper": {
+      "command": "C:\\RustSweeper\\rustsweeper.exe",
+      "args": ["--db", "C:\\RustSweeper\\rustsweeper.db", "mcp"]
+    }
+  }
+}
+```
+
+**Claude Code:**
+
+```sh
+claude mcp add rustsweeper -- C:\RustSweeper\rustsweeper.exe --db C:\RustSweeper\rustsweeper.db mcp
+```
+
+**Cursor** (`.cursor/mcp.json`): same `command`/`args` block as Claude Desktop.
+
+The MCP server reads the same database as `serve`, so you can run both at once. Before connecting a
+third-party AI assistant, check that it's allowed under your organization's AI-use policy — asset data
+(names, IPs, notes) is sent to the assistant when it answers.
+
 ## REST API
 
 | Method | Path | Notes |
@@ -88,6 +143,8 @@ For full MAC-vendor coverage, download `https://standards-oui.ieee.org/oui/oui.c
 | GET | `/api/scans` | Scan history |
 | POST | `/api/scans` | Body `{"targets":"10.0.0.0/24"}` → `{"id": n}` |
 | GET | `/api/scans/{id}` | Scan status + live progress |
+| GET | `/api/datasets` | Queryable datasets, fields and operators |
+| POST | `/api/query` | Structured query (same format as the MCP `execute_query` tool; up to 1000 rows) |
 
 CSV export: `GET /export.csv` (takes the same filters as the asset list).
 
@@ -108,7 +165,7 @@ nssm start RustSweeper
 - Per-scan limit is 65,536 addresses (a /16).
 - Basic auth sends credentials in clear text; put it behind HTTPS (IIS/nginx reverse proxy)
   if it's reachable beyond the IT VLAN.
-- This version is agentless and unauthenticated. Credentialed inventory (installed software,
+- This version is agentless and doesn't log in to devices. Credentialed inventory (installed software,
   hardware specs via WMI/WinRM, SSH) or an endpoint agent are natural next steps.
 
 ## Project layout
@@ -118,6 +175,12 @@ src/
   main.rs              CLI (clap)
   db.rs                SQLite schema, upserts, change tracking
   web.rs               axum dashboard, REST API, CSV export, scheduler
+  query.rs             structured, injection-safe query engine (datasets/fields/filters)
+  mcp/
+    mod.rs             MCP JSON-RPC dispatch, tools, docs search
+    catalog.rs         pre-built query templates
+    prompts.rs         MCP prompts (IT workflows)
+    stdio.rs           stdio transport
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

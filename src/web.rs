@@ -35,7 +35,7 @@ impl AppState {
         Self { db, opts, running: Arc::new(Mutex::new(HashMap::new())), auth }
     }
 
-    fn progress(&self, id: i64) -> Option<Arc<Progress>> {
+    pub fn progress_of(&self, id: i64) -> Option<Arc<Progress>> {
         self.running.lock().unwrap().get(&id).cloned()
     }
 }
@@ -87,6 +87,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/assets/{id}", get(api_asset))
         .route("/api/scans", get(api_scans).post(api_start_scan))
         .route("/api/scans/{id}", get(api_scan))
+        .route("/api/query", post(api_query))
+        .route("/api/datasets", get(api_datasets))
         .layer(middleware::from_fn_with_state(state.clone(), basic_auth))
         .with_state(state)
 }
@@ -562,7 +564,7 @@ async fn scans_page(State(st): State<AppState>) -> WebResult<Html<String>> {
 
 async fn scan_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
     let Some(s) = st.db.get_scan(id)? else { return Ok(not_found()) };
-    let prog = st.progress(id);
+    let prog = st.progress_of(id);
     let (progress_html, head) = match &prog {
         Some(p) => {
             let total = p.total.load(Ordering::Relaxed).max(1);
@@ -741,7 +743,7 @@ async fn api_scans(State(st): State<AppState>) -> WebResult<Json<serde_json::Val
 
 async fn api_scan(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
     let Some(s) = st.db.get_scan(id)? else { return Ok((StatusCode::NOT_FOUND, Json(json!({"error":"not found"}))).into_response()) };
-    Ok(Json(json!({ "scan": s, "progress": st.progress(id).as_deref() })).into_response())
+    Ok(Json(json!({ "scan": s, "progress": st.progress_of(id).as_deref() })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -754,6 +756,19 @@ async fn api_start_scan(State(st): State<AppState>, Json(r): Json<ApiScanReq>) -
         Ok(id) => (StatusCode::ACCEPTED, Json(json!({ "id": id }))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{e:#}") }))).into_response(),
     }
+}
+
+/// Structured query (same engine as the MCP `execute_query` tool, larger page size).
+async fn api_query(State(st): State<AppState>, Json(v): Json<serde_json::Value>) -> Response {
+    let res = crate::query::parse(v).and_then(|q| crate::query::execute(&st.db, &q, crate::query::API_LIMITS));
+    match res {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{e:#}") }))).into_response(),
+    }
+}
+
+async fn api_datasets() -> Json<serde_json::Value> {
+    Json(crate::query::describe(None))
 }
 
 // ---------------------------------------------------------------- scheduler

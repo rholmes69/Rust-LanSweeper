@@ -265,6 +265,11 @@ impl Db {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Run a closure with the raw connection (used by the structured query engine).
+    pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        f(&self.lock())
+    }
+
     // ---------------------------------------------------------------- assets
 
     pub fn list_assets(&self, f: &AssetFilter) -> Result<Vec<Asset>> {
