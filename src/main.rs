@@ -1,6 +1,8 @@
 //! RustSweeper — an agentless, Lansweeper-style network asset inventory written in Rust.
 
 mod db;
+mod mcp;
+mod query;
 mod scanner;
 mod web;
 
@@ -77,6 +79,15 @@ enum Cmd {
         #[command(flatten)]
         scan: ScanArgs,
     },
+    /// Run an MCP (Model Context Protocol) server on stdio for AI assistants
+    /// (Claude Desktop, Claude Code, Cursor…). Read-only unless --allow-scans.
+    Mcp {
+        /// Expose the start_scan tool so the assistant can launch discovery scans.
+        #[arg(long)]
+        allow_scans: bool,
+        #[command(flatten)]
+        scan: ScanArgs,
+    },
     /// Scan targets from the command line and store results.
     Scan {
         /// Targets: CIDR, ranges, IPs or hostnames (e.g. 10.0.0.0/24 10.0.1.5-40).
@@ -128,6 +139,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "rustsweeper=info".into()),
         )
+        .with_writer(std::io::stderr) // stdout is reserved for data (and the MCP stdio transport)
         .init();
     let cli = Cli::parse();
     if let Some(f) = &cli.oui_file {
@@ -154,6 +166,10 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
             println!("RustSweeper dashboard: http://{bind}/");
             axum::serve(listener, app).await?;
+        }
+        Cmd::Mcp { allow_scans, scan } => {
+            let state = web::AppState::new(db, scan.options(), None);
+            mcp::stdio::serve(mcp::McpServer::new(state, allow_scans)).await?;
         }
         Cmd::Scan { targets, scan } => {
             let spec = targets.join(",");

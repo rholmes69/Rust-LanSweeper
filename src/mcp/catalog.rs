@@ -1,0 +1,226 @@
+//! Pre-built query templates (the equivalent of Lansweeper's query catalog).
+
+use serde::Serialize;
+use serde_json::{json, Value};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Template {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    pub tags: &'static [&'static str],
+    /// Ready-to-run argument for `execute_query`.
+    pub query: Value,
+}
+
+pub fn templates() -> Vec<Template> {
+    vec![
+        Template {
+            id: "remote-access-exposed",
+            title: "Devices exposing remote access (RDP, VNC, Telnet)",
+            description: "Assets with TCP 3389, 5900 or 23 open — review that each is expected and restricted.",
+            tags: &["security", "rdp", "vnc", "telnet", "remote", "exposure"],
+            query: json!({"dataset":"assets","filters":[{"field":"has_port","op":"in","value":[3389,5900,23]}],
+                          "fields":["id","ip","name","device_type","os_guess","port_list","status"]}),
+        },
+        Template {
+            id: "telnet-ftp-cleartext",
+            title: "Clear-text management protocols (Telnet, FTP)",
+            description: "Assets with Telnet (23) or FTP (21) open; credentials cross the network unencrypted.",
+            tags: &["security", "telnet", "ftp", "cleartext", "compliance", "hipaa"],
+            query: json!({"dataset":"ports","filters":[{"field":"port","op":"in","value":[21,23]}],
+                          "fields":["asset_id","asset_name","ip","port","service","banner"]}),
+        },
+        Template {
+            id: "smb-exposed",
+            title: "Devices with SMB file sharing (445)",
+            description: "SMB on non-Windows devices or unexpected hosts is worth checking.",
+            tags: &["security", "smb", "file sharing", "445"],
+            query: json!({"dataset":"assets","filters":[{"field":"has_port","op":"eq","value":445}],
+                          "fields":["id","ip","name","device_type","os_guess","domain"]}),
+        },
+        Template {
+            id: "database-ports",
+            title: "Database servers (SQL Server, MySQL, PostgreSQL)",
+            description: "Assets listening on 1433, 3306 or 5432.",
+            tags: &["database", "sql", "mssql", "mysql", "postgres", "servers"],
+            query: json!({"dataset":"ports","filters":[{"field":"port","op":"in","value":[1433,3306,5432]}],
+                          "fields":["asset_id","asset_name","ip","port","service"]}),
+        },
+        Template {
+            id: "medical-interfaces",
+            title: "Medical interfaces (HL7 2575, DICOM 104)",
+            description: "Systems speaking HL7 or DICOM — EHR interfaces, PACS, modalities.",
+            tags: &["medical", "hl7", "dicom", "ehr", "pacs", "clinical"],
+            query: json!({"dataset":"ports","filters":[{"field":"port","op":"in","value":[104,2575]}],
+                          "fields":["asset_id","asset_name","ip","port","service","device_type"]}),
+        },
+        Template {
+            id: "new-assets-7d",
+            title: "New devices in the last 7 days",
+            description: "Assets first discovered within the past week.",
+            tags: &["new", "recent", "discovered", "rogue", "week"],
+            query: json!({"dataset":"assets","filters":[{"field":"first_seen","op":"gte","value":"now-7d"}],
+                          "sort":{"field":"first_seen","desc":true},
+                          "fields":["id","ip","name","mac","vendor","device_type","first_seen"]}),
+        },
+        Template {
+            id: "offline-assets",
+            title: "Offline devices",
+            description: "Assets that did not respond to the most recent scan covering their IP.",
+            tags: &["offline", "down", "missing", "status"],
+            query: json!({"dataset":"assets","filters":[{"field":"status","op":"eq","value":"offline"}],
+                          "sort":{"field":"last_seen","desc":true},
+                          "fields":["id","ip","name","device_type","last_seen"]}),
+        },
+        Template {
+            id: "offline-printers",
+            title: "Offline printers",
+            description: "Printers that stopped responding.",
+            tags: &["printer", "offline", "helpdesk"],
+            query: json!({"dataset":"assets","filters":[{"field":"device_type","op":"eq","value":"Printer"},
+                                                        {"field":"status","op":"eq","value":"offline"}],
+                          "fields":["id","ip","name","vendor","snmp_location","last_seen"]}),
+        },
+        Template {
+            id: "stale-30d",
+            title: "Not seen in 30 days",
+            description: "Candidates for retirement or inventory cleanup.",
+            tags: &["stale", "lifecycle", "cleanup", "retire", "old"],
+            query: json!({"dataset":"assets","filters":[{"field":"last_seen","op":"lt","value":"now-30d"}],
+                          "sort":{"field":"last_seen"},
+                          "fields":["id","ip","name","device_type","last_seen"]}),
+        },
+        Template {
+            id: "unknown-devices",
+            title: "Unidentified devices",
+            description: "Assets with no device type or no vendor — investigate what they are.",
+            tags: &["unknown", "unidentified", "rogue", "vendor", "shadow it"],
+            query: json!({"dataset":"assets","match_any":true,
+                          "filters":[{"field":"device_type","op":"is_null"},{"field":"vendor","op":"is_null"}],
+                          "fields":["id","ip","name","mac","vendor","device_type","port_list"]}),
+        },
+        Template {
+            id: "randomized-macs",
+            title: "Devices with randomized/private MACs",
+            description: "Usually phones or laptops with MAC privacy on; can't be tracked reliably by MAC.",
+            tags: &["mac", "random", "private", "byod", "phones"],
+            query: json!({"dataset":"assets","filters":[{"field":"vendor","op":"eq","value":"Private/randomized MAC"}],
+                          "fields":["id","ip","name","mac","last_seen"]}),
+        },
+        Template {
+            id: "port-changes-7d",
+            title: "Ports opened or closed in the last 7 days",
+            description: "Service changes detected between scans.",
+            tags: &["changes", "ports", "drift", "security", "week"],
+            query: json!({"dataset":"changes","filters":[{"field":"change","op":"in","value":["port opened","port closed"]},
+                                                         {"field":"at","op":"gte","value":"now-7d"}]}),
+        },
+        Template {
+            id: "changes-24h",
+            title: "All changes in the last 24 hours",
+            description: "Everything the scanner noticed changing since yesterday.",
+            tags: &["changes", "today", "recent", "audit"],
+            query: json!({"dataset":"changes","filters":[{"field":"at","op":"gte","value":"now-24h"}]}),
+        },
+        Template {
+            id: "assets-by-type",
+            title: "Asset count by device type",
+            description: "Inventory breakdown.",
+            tags: &["summary", "count", "type", "breakdown", "inventory"],
+            query: json!({"dataset":"assets","group_by":"device_type","limit":20}),
+        },
+        Template {
+            id: "assets-by-vendor",
+            title: "Asset count by vendor",
+            description: "Which hardware vendors are most common.",
+            tags: &["summary", "count", "vendor", "manufacturer"],
+            query: json!({"dataset":"assets","group_by":"vendor","limit":20}),
+        },
+        Template {
+            id: "assets-by-os",
+            title: "Asset count by operating system",
+            description: "OS distribution from fingerprinting.",
+            tags: &["summary", "os", "operating system", "windows", "linux"],
+            query: json!({"dataset":"assets","group_by":"os_guess","limit":20}),
+        },
+        Template {
+            id: "most-common-ports",
+            title: "Most common open ports",
+            description: "Which services are most widely exposed across the network.",
+            tags: &["ports", "services", "summary", "exposure"],
+            query: json!({"dataset":"ports","group_by":"port","limit":20}),
+        },
+        Template {
+            id: "windows-servers",
+            title: "Windows servers and domain controllers",
+            description: "Windows hosts with server roles (DNS, Kerberos, LDAP, SQL, SMTP).",
+            tags: &["windows", "server", "domain controller", "ad"],
+            query: json!({"dataset":"assets","filters":[{"field":"device_type","op":"in","value":["Windows Server","Windows Domain Controller","Windows Server (VM)","Windows Domain Controller (VM)"]}],
+                          "fields":["id","ip","name","domain","device_type","port_list"]}),
+        },
+        Template {
+            id: "network-devices",
+            title: "Network infrastructure",
+            description: "Switches, routers, firewalls and access points.",
+            tags: &["network", "switch", "router", "firewall", "infrastructure"],
+            query: json!({"dataset":"assets","filters":[{"field":"device_type","op":"eq","value":"Network Device"}],
+                          "fields":["id","ip","name","vendor","snmp_descr","snmp_location"]}),
+        },
+        Template {
+            id: "recent-scans",
+            title: "Recent scans",
+            description: "Latest scan runs and their results.",
+            tags: &["scans", "history", "status"],
+            query: json!({"dataset":"scans"}),
+        },
+    ]
+}
+
+/// Keyword search across ids, titles, descriptions and tags. Empty query returns everything.
+pub fn search(q: Option<&str>) -> Vec<Template> {
+    let all = templates();
+    let words: Vec<String> = q
+        .unwrap_or("")
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 1)
+        .map(String::from)
+        .collect();
+    if words.is_empty() {
+        return all;
+    }
+    let mut scored: Vec<(usize, Template)> = all
+        .into_iter()
+        .filter_map(|t| {
+            let hay = format!("{} {} {} {}", t.id, t.title, t.description, t.tags.join(" ")).to_lowercase();
+            let score = words.iter().filter(|w| hay.contains(w.as_str())).count();
+            (score > 0).then_some((score, t))
+        })
+        .collect();
+    scored.sort_by_key(|x| std::cmp::Reverse(x.0));
+    scored.into_iter().map(|(_, t)| t).collect()
+}
+
+pub fn get(id: &str) -> Option<Template> {
+    templates().into_iter().find(|t| t.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_template_parses() {
+        for t in templates() {
+            crate::query::parse(t.query.clone()).unwrap_or_else(|e| panic!("{}: {e}", t.id));
+        }
+    }
+
+    #[test]
+    fn search_ranks() {
+        let r = search(Some("printers offline"));
+        assert_eq!(r[0].id, "offline-printers");
+        assert!(search(Some("zzzz")).is_empty());
+    }
+}
