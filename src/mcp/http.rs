@@ -22,6 +22,8 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use super::{rpc_error, CallContext, McpServer, INVALID_REQUEST, PARSE_ERROR};
+use crate::auth::Principal;
+use crate::query::Scope;
 
 pub const SESSION_HEADER: &str = "mcp-session-id";
 /// Same idle timeout as Lansweeper's MCP server.
@@ -83,10 +85,10 @@ fn origin_ok(headers: &HeaderMap) -> bool {
     headers.get(header::HOST).and_then(|v| v.to_str().ok()).is_some_and(|h| host_of(h) == o)
 }
 
-/// Returns Ok(client name) or an error response.
-fn authenticate(mcp: &HttpMcp, headers: &HeaderMap) -> Result<Option<String>, Response> {
+/// Returns the caller or an error response.
+fn authenticate(mcp: &HttpMcp, headers: &HeaderMap) -> Result<Principal, Response> {
     if !mcp.require_auth {
-        return Ok(Some("unauthenticated (localhost)".into()));
+        return Ok(Principal { name: "unauthenticated (localhost)".into(), sites: None });
     }
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -101,7 +103,7 @@ fn authenticate(mcp: &HttpMcp, headers: &HeaderMap) -> Result<Option<String>, Re
         return Err(unauthorized("missing bearer token (create one with `rustsweeper token create <name>`)"));
     };
     match crate::auth::verify(&mcp.server.state.db, tok) {
-        Ok(Some(name)) => Ok(Some(name)),
+        Ok(Some(p)) => Ok(p),
         Ok(None) => Err(unauthorized("invalid or revoked token")),
         Err(e) => {
             tracing::error!("token check failed: {e:#}");
@@ -127,10 +129,11 @@ async fn post_mcp(
     if !origin_ok(&headers) {
         return json_error(StatusCode::FORBIDDEN, INVALID_REQUEST, "origin not allowed");
     }
-    let client = match authenticate(&mcp, &headers) {
-        Ok(c) => c,
+    let principal = match authenticate(&mcp, &headers) {
+        Ok(p) => p,
         Err(r) => return r,
     };
+    let client = Some(principal.name.clone());
     if body.len() > MAX_BODY {
         return json_error(StatusCode::PAYLOAD_TOO_LARGE, INVALID_REQUEST, "request too large");
     }
@@ -157,7 +160,13 @@ async fn post_mcp(
         }
     }
 
-    let ctx = CallContext { transport: "http", client: client.clone(), remote_addr: Some(addr.ip().to_string()) };
+    let ctx = CallContext {
+        transport: "http",
+        client: client.clone(),
+        remote_addr: Some(addr.ip().to_string()),
+        // Scope is re-read from the token on every request, so edits/revocations apply immediately.
+        scope: Scope { sites: principal.sites.clone() },
+    };
     let reply = mcp.server.handle(msg, &ctx).await;
 
     let mut new_session = None;
@@ -194,7 +203,7 @@ async fn delete_mcp(State(mcp): State<Arc<HttpMcp>>, headers: HeaderMap) -> Resp
         return json_error(StatusCode::FORBIDDEN, INVALID_REQUEST, "origin not allowed");
     }
     let client = match authenticate(&mcp, &headers) {
-        Ok(c) => c,
+        Ok(p) => Some(p.name),
         Err(r) => return r,
     };
     let Some(sid) = headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()) else {
@@ -262,8 +271,8 @@ mod tests {
     #[tokio::test]
     async fn auth_sessions_audit() {
         let (app, db) = app(true, IDLE_TIMEOUT);
-        let (_, tok) = crate::auth::create(&db, "claude").unwrap();
-        let (_, tok2) = crate::auth::create(&db, "cursor").unwrap();
+        let (_, tok) = crate::auth::create(&db, "claude", None).unwrap();
+        let (_, tok2) = crate::auth::create(&db, "cursor", None).unwrap();
 
         // No / bad token.
         assert_eq!(call(&app, None, None, None, init()).await.0, StatusCode::UNAUTHORIZED);
@@ -313,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn idle_timeout_and_delete() {
         let (app, db) = app(true, Duration::from_millis(50));
-        let (_, tok) = crate::auth::create(&db, "t").unwrap();
+        let (_, tok) = crate::auth::create(&db, "t", None).unwrap();
         let (_, h, _) = call(&app, Some(&tok), None, None, init()).await;
         let sid = h.get(SESSION_HEADER).unwrap().to_str().unwrap().to_string();
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -333,5 +342,20 @@ mod tests {
         let (st, h, _) = call(&app, None, None, None, init()).await;
         assert_eq!(st, StatusCode::OK);
         assert!(h.get(SESSION_HEADER).is_some());
+    }
+
+    #[tokio::test]
+    async fn scoped_token_over_http() {
+        let (app, db) = app(true, IDLE_TIMEOUT);
+        let clinic = db.add_site("Dental", "10.9.0.0/24", "").unwrap();
+        db.add_site("Admin", "10.8.0.0/24", "").unwrap();
+        let (_, tok) = crate::auth::create(&db, "dental-assistant", Some(&[clinic])).unwrap();
+        let (_, h, _) = call(&app, Some(&tok), None, None, init()).await;
+        let sid = h.get(SESSION_HEADER).unwrap().to_str().unwrap().to_string();
+        let (_, _, body) = call(&app, Some(&tok), Some(&sid), None,
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_sites","arguments":{}}})).await;
+        let sites = body["result"]["structuredContent"]["sites"].as_array().unwrap().clone();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0]["name"], "Dental");
     }
 }

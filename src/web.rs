@@ -42,7 +42,12 @@ impl AppState {
 
 /// Validate targets, then run the scan in the background. Returns the new scan id.
 pub fn launch_scan(state: &AppState, spec: &str, trigger: &str) -> Result<i64> {
-    let (id, ips) = scanner::prepare_scan(&state.db, spec, trigger)?;
+    launch_scan_for_site(state, spec, trigger, None)
+}
+
+/// Launch a scan recorded against a site (used for "scan this site" and site schedules).
+pub fn launch_scan_for_site(state: &AppState, spec: &str, trigger: &str, site_id: Option<i64>) -> Result<i64> {
+    let (id, ips) = scanner::prepare_site_scan(&state.db, spec, trigger, site_id)?;
     let progress = Arc::new(Progress::default());
     state.running.lock().unwrap().insert(id, progress.clone());
     let st = state.clone();
@@ -75,6 +80,12 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/{id}", get(asset_page))
         .route("/assets/{id}/notes", post(save_notes))
         .route("/assets/{id}/delete", post(delete_asset))
+        .route("/assets/{id}/site", post(set_asset_site))
+        .route("/sites", get(sites_page).post(add_site))
+        .route("/sites/{id}", get(site_page).post(update_site))
+        .route("/sites/{id}/delete", post(delete_site))
+        .route("/sites/{id}/scan", post(scan_site))
+        .route("/api/sites", get(api_sites))
         .route("/scans", get(scans_page).post(start_scan_form))
         .route("/scans/{id}", get(scan_page))
         .route("/schedules", get(schedules_page).post(add_schedule))
@@ -213,7 +224,7 @@ fn page(title: &str, active: &str, body: String) -> Html<String> {
 }
 
 fn page_ext(title: &str, active: &str, body: String, head_extra: &str) -> Html<String> {
-    let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("scans", "/scans", "Scans"),
+    let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("sites", "/sites", "Sites"), ("scans", "/scans", "Scans"),
         ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes"), ("ai", "/ai-access", "AI access")]
         .iter()
         .map(|(k, href, label)| {
@@ -286,6 +297,27 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
             })
             .collect()
     };
+    let max_s = s.by_site.iter().map(|x| x.1).max().unwrap_or(1).max(1);
+    let site_ids: std::collections::HashMap<String, i64> = st.db.list_sites()?.into_iter().map(|x| (x.name, x.id)).collect();
+    let site_bars = if s.by_site.is_empty() {
+        "<p class=muted>No assets yet.</p>".to_string()
+    } else {
+        let mut html: String = s
+            .by_site
+            .iter()
+            .map(|(k, v)| {
+                let id = site_ids.get(k).copied().unwrap_or(0);
+                format!(
+                    "<div class=bar><div class=lbl><a href='/assets?site={id}'>{}</a></div><div class=trk><div class=fill style='width:{}%'></div></div><div class=v>{v}</div></div>",
+                    esc(k), (v * 100 / max_s).max(2)
+                )
+            })
+            .collect();
+        if site_ids.is_empty() {
+            html.push_str("<p class=hint><a href=/sites>Define sites</a> (e.g. one per clinic) to group assets by location.</p>");
+        }
+        html
+    };
     let scan_rows: String = scans
         .iter()
         .map(|sc| {
@@ -304,7 +336,8 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
            <div class='card stat'><div class=l>New (7 days)</div><div class=n>{}</div></div>\
          </div>\
          <div class=card><h2>Quick scan</h2>{}</div>\
-         <div class='grid g2'><div class=card><h2>Assets by type</h2>{}</div><div class=card><h2>Top vendors</h2>{}</div></div>\
+         <div class='grid g2'><div class=card><h2>Assets by type</h2>{}</div><div class=card><h2>Assets by site</h2>{}</div></div>\
+         <div class='grid g2'><div class=card><h2>Top vendors</h2>{}</div><div></div></div>\
          <div class='grid g2'>\
            <div class=card><h2>Recent scans</h2><table><tr><th>Scan</th><th>Targets</th><th>Status</th><th>Up</th><th>Started</th></tr>{}</table></div>\
            <div class=card><h2>Recent changes</h2>{}</div>\
@@ -312,6 +345,7 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
         s.total, s.online, s.offline, s.new_7d,
         scan_form(&suggested_subnet()),
         bars(&s.by_type, max_t, true),
+        site_bars,
         bars(&s.by_vendor, max_v, false),
         if scan_rows.is_empty() { "<tr><td colspan=5 class=muted>No scans yet</td></tr>".into() } else { scan_rows },
         changes_table(&changes, true),
@@ -353,6 +387,8 @@ struct AssetQuery {
     status: Option<String>,
     sort: Option<String>,
     desc: Option<String>,
+    /// Site id; "0" = unassigned.
+    site: Option<String>,
 }
 
 impl AssetQuery {
@@ -364,6 +400,8 @@ impl AssetQuery {
             sort: self.sort.clone(),
             desc: self.desc.as_deref() == Some("1"),
             scan_id: None,
+            site_id: self.site.as_deref().and_then(|s| s.parse().ok()),
+            allowed_sites: None,
         }
     }
 }
@@ -385,17 +423,17 @@ fn assets_table(assets: &[Asset], sort_base: Option<(&AssetQuery, String)>) -> S
         .iter()
         .map(|a| {
             format!(
-                "<tr><td class=mono>{}</td><td>{}</td><td class=mono>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=muted style='white-space:nowrap'>{}</td></tr>",
-                esc(&a.ip), asset_name_link(a), opt(&a.mac), opt(&a.vendor), opt(&a.device_type),
+                "<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td class=mono>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=muted style='white-space:nowrap'>{}</td></tr>",
+                esc(&a.ip), asset_name_link(a), opt(&a.site), opt(&a.mac), opt(&a.vendor), opt(&a.device_type),
                 opt(&a.os_guess), a.open_ports, status_pill(&a.status), esc(&a.last_seen)
             )
         })
         .collect();
     format!(
-        "<table><tr>{}{}{}{}{}{}{}{}{}</tr>{}</table>",
-        th("ip", "IP"), th("name", "Name"), th("mac", "MAC"), th("vendor", "Vendor"), th("type", "Type"),
+        "<table><tr>{}{}{}{}{}{}{}{}{}{}</tr>{}</table>",
+        th("ip", "IP"), th("name", "Name"), th("site", "Site"), th("mac", "MAC"), th("vendor", "Vendor"), th("type", "Type"),
         th("os", "OS"), th("ports", "Ports"), th("status", "Status"), th("last_seen", "Last seen"),
-        if rows.is_empty() { "<tr><td colspan=9 class=muted>No matching assets</td></tr>".into() } else { rows }
+        if rows.is_empty() { "<tr><td colspan=10 class=muted>No matching assets</td></tr>".into() } else { rows }
     )
 }
 
@@ -408,16 +446,22 @@ async fn assets_page(State(st): State<AppState>, Query(q): Query<AssetQuery>) ->
         .map(|t| format!("<option value='{}'{}>{}</option>", esc(t), sel(t, &q.device_type), esc(t)))
         .collect();
     let base = format!(
-        "q={}&type={}&status={}",
+        "q={}&type={}&status={}&site={}",
         url_enc(q.q.as_deref().unwrap_or("")),
         url_enc(q.device_type.as_deref().unwrap_or("")),
-        url_enc(q.status.as_deref().unwrap_or(""))
+        url_enc(q.status.as_deref().unwrap_or("")),
+        url_enc(q.site.as_deref().unwrap_or(""))
     );
+    let site_opts: String = std::iter::once((0i64, "Unassigned".to_string()))
+        .chain(st.db.list_sites()?.into_iter().map(|x| (x.id, x.name)))
+        .map(|(id, n)| format!("<option value='{id}'{}>{}</option>", sel(&id.to_string(), &q.site), esc(&n)))
+        .collect();
     let body = format!(
         "<div class=row><h1>Assets <span class=muted style='font-weight:400'>({})</span></h1><div class=spacer></div>\
          <a class=btn href='/export.csv?{base}'>Export CSV</a></div>\
          <div class=card><form class=row action=/assets>\
            <input type=text name=q value='{}' placeholder='Search…' style='flex:1;min-width:220px'>\
+           <select name=site><option value=''>All sites</option>{site_opts}</select>\
            <select name=type><option value=''>All types</option>{type_opts}</select>\
            <select name=status><option value=''>Any status</option><option{}>online</option><option{}>offline</option></select>\
            <button>Filter</button><a href=/assets class=muted>Reset</a></form></div>\
@@ -463,6 +507,8 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
           <div>\
            <div class=card><h2>SNMP</h2><dl>{snmp}</dl></div>\
            <div class=card><h2>Web</h2><dl>{web}</dl></div>\
+           <div class=card><h2>Site</h2><form method=post action='/assets/{id}/site' class=row><select name=site_id>{site_opts}</select><button class=ghost>Set</button></form>\
+             <div class=hint>&ldquo;Automatic&rdquo; places the asset by its IP and your site subnets.</div></div>\
            <div class=card><h2>Notes</h2><form method=post action='/assets/{id}/notes'><textarea name=notes placeholder='Owner, location, asset tag, warranty…'>{notes}</textarea><div style='margin-top:8px'><button>Save notes</button></div></form></div>\
           </div>\
          </div>",
@@ -477,6 +523,9 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
             row("DNS name", opt(&a.hostname)),
             row("NetBIOS name", opt(&a.netbios_name)),
             row("Domain / workgroup", opt(&a.netbios_domain)),
+            row("Site", format!("{} <span class=muted>{}</span>",
+                a.site_id.map(|sid| format!("<a href='/sites/{sid}'>{}</a>", opt(&a.site))).unwrap_or_else(|| "<span class=muted>Unassigned</span>".into()),
+                if a.site_manual { "(set manually)" } else { "(by subnet)" })),
             row("Device type", opt(&a.device_type)),
             row("OS (guess)", opt(&a.os_guess)),
             row("TTL", a.ttl.map(|t| t.to_string()).unwrap_or_else(|| "—".into())),
@@ -497,6 +546,11 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
         .concat(),
         web = [row("Server", opt(&a.http_server)), row("Title", opt(&a.http_title))].concat(),
         notes = esc(&a.notes),
+        site_opts = std::iter::once(format!("<option value=''{}>Automatic (by subnet)</option>", if a.site_manual { "" } else { " selected" }))
+            .chain(st.db.list_sites()?.iter().map(|x| format!(
+                "<option value='{}'{}>{}</option>", x.id,
+                if a.site_manual && a.site_id == Some(x.id) { " selected" } else { "" }, esc(&x.name))))
+            .collect::<String>(),
     );
     Ok(page(&a.display_name(), "assets", body).into_response())
 }
@@ -610,11 +664,17 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult
 #[derive(Deserialize)]
 struct ScheduleForm {
     name: String,
+    #[serde(default)]
     targets: String,
     interval_minutes: i64,
+    /// Site id; when set the schedule scans that site's subnets.
+    #[serde(default)]
+    site_id: String,
 }
 
 async fn schedules_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let sites = st.db.list_sites()?;
+    let site_name = |id: Option<i64>| id.and_then(|i| sites.iter().find(|s| s.id == i)).map(|s| s.name.clone());
     let rows: String = st
         .db
         .list_schedules()?
@@ -624,7 +684,9 @@ async fn schedules_page(State(st): State<AppState>) -> WebResult<Html<String>> {
                 "<tr><td>{}</td><td class=mono>{}</td><td>every {}</td><td>{}</td><td class=muted>{}</td>\
                  <td><form class=inline method=post action='/schedules/{id}/toggle'><button class=ghost>{}</button></form> \
                  <form class=inline method=post action='/schedules/{id}/delete'><button class=danger>Delete</button></form></td></tr>",
-                esc(&s.name), esc(&s.targets), human_minutes(s.interval_minutes),
+                esc(&s.name),
+                match site_name(s.site_id) { Some(n) => format!("Site: {} <span class=muted>(its subnets)</span>", esc(&n)), None => esc(&s.targets) },
+                human_minutes(s.interval_minutes),
                 if s.enabled { status_pill("online").replace("online", "enabled") } else { status_pill("offline").replace("offline", "paused") },
                 opt(&s.last_run),
                 if s.enabled { "Pause" } else { "Resume" },
@@ -636,11 +698,13 @@ async fn schedules_page(State(st): State<AppState>) -> WebResult<Html<String>> {
         "<h1>Scheduled scans</h1>\
          <div class=card><h2>Add schedule</h2><form method=post action=/schedules class=row>\
            <input type=text name=name placeholder='Name (e.g. Main clinic LAN)' required>\
-           <input type=text name=targets placeholder='10.0.0.0/24' value='{}' required style='flex:1;min-width:200px'>\
+           <select name=site_id><option value=''>Custom targets →</option>{}</select>\
+           <input type=text name=targets placeholder='10.0.0.0/24' value='{}' style='flex:1;min-width:200px'>\
            <select name=interval_minutes><option value=60>Hourly</option><option value=240>Every 4 hours</option>\
              <option value=720>Every 12 hours</option><option value=1440 selected>Daily</option><option value=10080>Weekly</option></select>\
            <button>Add</button></form><div class=hint>Schedules run while <code>rustsweeper serve</code> is running.</div></div>\
          <div class=card style='padding:0'><table><tr><th>Name</th><th>Targets</th><th>Interval</th><th>State</th><th>Last run</th><th></th></tr>{}</table></div>",
+        sites.iter().map(|x| format!("<option value='{}'>Site: {}</option>", x.id, esc(&x.name))).collect::<String>(),
         esc(&suggested_subnet()),
         if rows.is_empty() { "<tr><td colspan=6 class=muted>No schedules</td></tr>".into() } else { rows }
     );
@@ -657,6 +721,11 @@ fn human_minutes(m: i64) -> String {
 }
 
 async fn add_schedule(State(st): State<AppState>, Form(f): Form<ScheduleForm>) -> WebResult<Response> {
+    if let Ok(site_id) = f.site_id.trim().parse::<i64>() {
+        let Some(site) = st.db.get_site(site_id)? else { return Ok(not_found()) };
+        st.db.add_schedule_for_site(f.name.trim(), &site.subnets, f.interval_minutes.max(5), Some(site_id))?;
+        return Ok(Redirect::to("/schedules").into_response());
+    }
     if let Err(e) = scanner::targets::parse_targets(&f.targets) {
         return Ok((StatusCode::BAD_REQUEST, page("Schedule error", "schedules",
             format!("<h1>Invalid targets</h1><div class=card><p style='color:var(--bad)'>{}</p><a href=/schedules>Back</a></div>", esc(&format!("{e:#}"))))).into_response());
@@ -732,6 +801,118 @@ async fn ai_access_page(State(st): State<AppState>) -> WebResult<Html<String>> {
     Ok(page("AI access", "ai", body))
 }
 
+// ---------------------------------------------------------------- sites
+
+#[derive(Deserialize)]
+struct SiteForm {
+    name: String,
+    subnets: String,
+    #[serde(default)]
+    description: String,
+}
+
+fn site_form(action: &str, name: &str, subnets: &str, description: &str, button: &str) -> String {
+    format!(
+        "<form method=post action='{action}'>\
+           <div class=row style='margin-bottom:8px'><input type=text name=name value='{}' placeholder='Name (e.g. Main Clinic)' required style='min-width:220px'>\
+           <input type=text name=subnets value='{}' placeholder='10.10.0.0/24, 10.10.1.0/24' required style='flex:1;min-width:260px'></div>\
+           <div class=row><input type=text name=description value='{}' placeholder='Description / address (optional)' style='flex:1'><button>{button}</button></div>\
+         </form><div class=hint>Subnets in CIDR form, comma separated. Assets are placed in the site whose subnet most specifically contains their IP; you can also pin individual assets by hand.</div>",
+        esc(name), esc(subnets), esc(description)
+    )
+}
+
+fn form_error(title: &str, active: &str, e: &anyhow::Error, back: &str) -> Response {
+    (StatusCode::BAD_REQUEST, page(title, active, format!(
+        "<h1>{}</h1><div class=card><p style='color:var(--bad)'>{}</p><a href='{back}'>Back</a></div>", esc(title), esc(&format!("{e:#}"))
+    ))).into_response()
+}
+
+async fn sites_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let sites = st.db.list_sites()?;
+    let unassigned = st.db.unassigned_count()?;
+    let rows: String = sites
+        .iter()
+        .map(|x| format!(
+            "<tr><td><a href='/sites/{0}'>{1}</a></td><td class=mono>{2}</td><td class=muted>{3}</td><td><a href='/assets?site={0}'>{4}</a></td><td>{5}</td>\
+             <td><form class=inline method=post action='/sites/{0}/scan'><button class=ghost>Scan now</button></form></td></tr>",
+            x.id, esc(&x.name), esc(&x.subnets), esc(&x.description), x.asset_count, x.online
+        ))
+        .collect();
+    let body = format!(
+        "<h1>Sites</h1>\
+         <div class=card><h2>Add site</h2>{}</div>\
+         <div class=card style='padding:0;overflow-x:auto'><table><tr><th>Site</th><th>Subnets</th><th>Description</th><th>Assets</th><th>Online</th><th></th></tr>{}\
+           <tr><td class=muted>Unassigned</td><td class=muted>—</td><td class=muted>IPs outside every site</td><td><a href='/assets?site=0'>{unassigned}</a></td><td></td><td></td></tr></table></div>",
+        site_form("/sites", "", "", "", "Add site"),
+        rows
+    );
+    Ok(page("Sites", "sites", body))
+}
+
+async fn add_site(State(st): State<AppState>, Form(f): Form<SiteForm>) -> WebResult<Response> {
+    let res = crate::sites::parse_subnets(&f.subnets)
+        .and_then(|n| st.db.add_site(&f.name, &crate::sites::format_subnets(&n), &f.description));
+    Ok(match res {
+        Ok(id) => Redirect::to(&format!("/sites/{id}")).into_response(),
+        Err(e) => form_error("Could not add site", "sites", &e, "/sites"),
+    })
+}
+
+async fn site_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
+    let Some(site) = st.db.get_site(id)? else { return Ok(not_found()) };
+    let assets = st.db.list_assets(&AssetFilter { site_id: Some(id), ..Default::default() })?;
+    let body = format!(
+        "<div class=row><h1>{}</h1><span class=muted>&nbsp;{} assets · {} online</span><div class=spacer></div>\
+           <form class=inline method=post action='/sites/{id}/scan'><button>Scan this site</button></form>\
+           <form class=inline method=post action='/sites/{id}/delete' onsubmit=\"return confirm('Delete this site? Its assets become unassigned.')\"><button class=danger>Delete</button></form></div>\
+         <div class=card><h2>Edit</h2>{}</div>\
+         <div class=card style='padding:0;overflow-x:auto'>{}</div>",
+        esc(&site.name), site.asset_count, site.online,
+        site_form(&format!("/sites/{id}"), &site.name, &site.subnets, &site.description, "Save"),
+        assets_table(&assets, None)
+    );
+    Ok(page(&site.name, "sites", body).into_response())
+}
+
+async fn update_site(State(st): State<AppState>, Path(id): Path<i64>, Form(f): Form<SiteForm>) -> WebResult<Response> {
+    let res = crate::sites::parse_subnets(&f.subnets)
+        .and_then(|n| st.db.update_site(id, &f.name, &crate::sites::format_subnets(&n), &f.description));
+    Ok(match res {
+        Ok(()) => Redirect::to(&format!("/sites/{id}")).into_response(),
+        Err(e) => form_error("Could not update site", "sites", &e, &format!("/sites/{id}")),
+    })
+}
+
+async fn delete_site(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Redirect> {
+    st.db.delete_site(id)?;
+    Ok(Redirect::to("/sites"))
+}
+
+async fn scan_site(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
+    let Some(site) = st.db.get_site(id)? else { return Ok(not_found()) };
+    let targets = crate::sites::scan_targets(&crate::sites::parse_subnets(&site.subnets)?);
+    Ok(match launch_scan_for_site(&st, &targets, &format!("site: {}", site.name), Some(id)) {
+        Ok(scan) => Redirect::to(&format!("/scans/{scan}")).into_response(),
+        Err(e) => form_error("Could not start scan", "sites", &e, &format!("/sites/{id}")),
+    })
+}
+
+#[derive(Deserialize)]
+struct AssetSiteForm {
+    #[serde(default)]
+    site_id: String,
+}
+
+async fn set_asset_site(State(st): State<AppState>, Path(id): Path<i64>, Form(f): Form<AssetSiteForm>) -> WebResult<Redirect> {
+    st.db.set_asset_site(id, f.site_id.trim().parse().ok())?;
+    Ok(Redirect::to(&format!("/assets/{id}")))
+}
+
+async fn api_sites(State(st): State<AppState>) -> WebResult<Json<serde_json::Value>> {
+    Ok(Json(json!(st.db.list_sites()?)))
+}
+
 // ---------------------------------------------------------------- CSV export
 
 fn csv_field(s: &str) -> String {
@@ -742,13 +923,13 @@ fn csv_field(s: &str) -> String {
 
 pub fn assets_csv(assets: &[Asset]) -> String {
     let mut out = String::from(
-        "ip,name,mac,vendor,dns_name,netbios_name,domain,device_type,os_guess,open_ports,status,snmp_descr,snmp_location,first_seen,last_seen,notes\r\n",
+        "ip,name,site,mac,vendor,dns_name,netbios_name,domain,device_type,os_guess,open_ports,status,snmp_descr,snmp_location,first_seen,last_seen,notes\r\n",
     );
     for a in assets {
         let o = |v: &Option<String>| csv_field(v.as_deref().unwrap_or(""));
         out.push_str(
             &[
-                csv_field(&a.ip), csv_field(&a.display_name()), o(&a.mac), o(&a.vendor), o(&a.hostname), o(&a.netbios_name),
+                csv_field(&a.ip), csv_field(&a.display_name()), o(&a.site), o(&a.mac), o(&a.vendor), o(&a.hostname), o(&a.netbios_name),
                 o(&a.netbios_domain), o(&a.device_type), o(&a.os_guess), a.open_ports.to_string(), csv_field(&a.status),
                 o(&a.snmp_descr), o(&a.snmp_location), csv_field(&a.first_seen), csv_field(&a.last_seen), csv_field(&a.notes),
             ]
@@ -809,7 +990,7 @@ async fn api_start_scan(State(st): State<AppState>, Json(r): Json<ApiScanReq>) -
 
 /// Structured query (same engine as the MCP `execute_query` tool, larger page size).
 async fn api_query(State(st): State<AppState>, Json(v): Json<serde_json::Value>) -> Response {
-    let res = crate::query::parse(v).and_then(|q| crate::query::execute(&st.db, &q, crate::query::API_LIMITS));
+    let res = crate::query::parse(v).and_then(|q| crate::query::execute(&st.db, &q, crate::query::API_LIMITS, &crate::query::Scope::all()));
     match res {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{e:#}") }))).into_response(),
@@ -840,7 +1021,14 @@ pub async fn scheduler(state: AppState) {
                 continue;
             }
             let _ = state.db.touch_schedule(s.id);
-            match launch_scan(&state, &s.targets, &format!("schedule: {}", s.name)) {
+            let targets = match s.site_id {
+                Some(sid) => match state.db.get_site(sid) {
+                    Ok(Some(site)) => crate::sites::scan_targets(&crate::sites::parse_subnets(&site.subnets).unwrap_or_default()),
+                    _ => continue,
+                },
+                None => s.targets.clone(),
+            };
+            match launch_scan_for_site(&state, &targets, &format!("schedule: {}", s.name), s.site_id) {
                 Ok(id) => tracing::info!(schedule = s.id, scan = id, "scheduled scan launched"),
                 Err(e) => tracing::warn!(schedule = s.id, "scheduled scan failed to start: {e:#}"),
             }

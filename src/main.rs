@@ -5,6 +5,7 @@ mod db;
 mod mcp;
 mod query;
 mod scanner;
+mod sites;
 mod web;
 
 use std::net::SocketAddr;
@@ -101,8 +102,11 @@ enum Cmd {
     /// Scan targets from the command line and store results.
     Scan {
         /// Targets: CIDR, ranges, IPs or hostnames (e.g. 10.0.0.0/24 10.0.1.5-40).
-        #[arg(required = true)]
+        #[arg(required_unless_present = "site")]
         targets: Vec<String>,
+        /// Scan all subnets of this site (id or name) instead of explicit targets.
+        #[arg(long)]
+        site: Option<String>,
         #[command(flatten)]
         scan: ScanArgs,
     },
@@ -111,6 +115,9 @@ enum Cmd {
         /// Free-text search (IP, name, MAC, vendor, OS, port...).
         #[arg(short, long)]
         search: Option<String>,
+        /// Only assets in this site (id or name; "unassigned" for none).
+        #[arg(long)]
+        site: Option<String>,
         /// Output CSV instead of a table.
         #[arg(long)]
         csv: bool,
@@ -132,6 +139,11 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    /// Manage sites (locations such as clinics, defined by their subnets).
+    Site {
+        #[command(subcommand)]
+        action: SiteCmd,
+    },
     /// Manage scheduled scans.
     Schedule {
         #[command(subcommand)]
@@ -142,10 +154,46 @@ enum Cmd {
 #[derive(Subcommand)]
 enum TokenCmd {
     /// Create a token (shown once — store it in your MCP client config).
-    Create { name: String },
+    Create {
+        name: String,
+        /// Limit the token to these sites (comma-separated names or ids). Default: all sites.
+        #[arg(long, value_delimiter = ',')]
+        sites: Option<Vec<String>>,
+    },
     List,
     /// Revoke by id or name. Active sessions using it stop working immediately.
     Revoke { id_or_name: String },
+}
+
+#[derive(Subcommand)]
+enum SiteCmd {
+    /// Add a site, e.g. `site add "Main Clinic" 10.10.0.0/24,10.10.1.0/24`.
+    Add {
+        name: String,
+        subnets: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    List,
+    /// Change a site's name, subnets or description.
+    Update {
+        site: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        subnets: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a site (its assets become unassigned).
+    Remove { site: String },
+    /// Pin an asset (id or IP) to a site, or `--auto` to return it to subnet-based assignment.
+    Assign {
+        asset: String,
+        site: Option<String>,
+        #[arg(long)]
+        auto: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -213,9 +261,15 @@ async fn main() -> Result<()> {
             let state = web::AppState::new(db, scan.options(), None);
             mcp::stdio::serve(mcp::McpServer::new(state, allow_scans)).await?;
         }
-        Cmd::Scan { targets, scan } => {
-            let spec = targets.join(",");
-            let (id, ips) = scanner::prepare_scan(&db, &spec, "cli")?;
+        Cmd::Scan { targets, site, scan } => {
+            let (spec, site_id) = match &site {
+                Some(s) => {
+                    let site = db.find_site(s)?.with_context(|| format!("no site '{s}'"))?;
+                    (sites::scan_targets(&sites::parse_subnets(&site.subnets)?), Some(site.id))
+                }
+                None => (targets.join(","), None),
+            };
+            let (id, ips) = scanner::prepare_site_scan(&db, &spec, "cli", site_id)?;
             println!("Scan #{id}: probing {} host(s)…", ips.len());
             let progress = Arc::new(Progress::default());
             let p2 = progress.clone();
@@ -236,8 +290,13 @@ async fn main() -> Result<()> {
             println!("Done: {} up, {} new asset(s).\n", s.hosts_up, s.new_assets);
             print_assets(&db.list_assets(&AssetFilter { scan_id: Some(id), ..Default::default() })?);
         }
-        Cmd::Assets { search, csv, json } => {
-            let assets = db.list_assets(&AssetFilter { q: search, ..Default::default() })?;
+        Cmd::Assets { search, site, csv, json } => {
+            let site_id = match site.as_deref() {
+                None => None,
+                Some(s) if s.eq_ignore_ascii_case("unassigned") => Some(0),
+                Some(s) => Some(db.find_site(s)?.with_context(|| format!("no site '{s}'"))?.id),
+            };
+            let assets = db.list_assets(&AssetFilter { q: search, site_id, ..Default::default() })?;
             if csv {
                 print!("{}", web::assets_csv(&assets));
             } else if json {
@@ -269,18 +328,38 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Token { action } => match action {
-            TokenCmd::Create { name } => {
-                let (id, token) = auth::create(&db, &name)?;
+            TokenCmd::Create { name, sites: site_names } => {
+                let ids = match &site_names {
+                    None => None,
+                    Some(list) => Some(
+                        list.iter()
+                            .map(|s| db.find_site(s)?.map(|x| x.id).with_context(|| format!("no site '{s}'")))
+                            .collect::<Result<Vec<i64>>>()?,
+                    ),
+                };
+                let (id, token) = auth::create(&db, &name, ids.as_deref())?;
+                if let Some(list) = &site_names {
+                    println!("Scoped to sites: {}", list.join(", "));
+                }
                 println!("Token #{id} '{name}' created. Copy it now — it will not be shown again:\n\n  {token}\n");
                 println!("Use it as an HTTP header in your MCP client:  Authorization: Bearer {token}");
             }
             TokenCmd::List => {
-                println!("{:<5} {:<24} {:<12} {:<20} {:<20} STATE", "ID", "NAME", "PREFIX", "CREATED", "LAST USED");
+                let all_sites = db.list_sites()?;
+                println!("{:<5} {:<24} {:<12} {:<20} {:<20} {:<8} SITES", "ID", "NAME", "PREFIX", "CREATED", "LAST USED", "STATE");
                 for t in db.list_tokens()? {
+                    let scope = match &t.sites {
+                        None => "all".to_string(),
+                        Some(ids) => ids
+                            .iter()
+                            .map(|i| all_sites.iter().find(|s| s.id == *i).map(|s| s.name.clone()).unwrap_or_else(|| format!("#{i} (deleted)")))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    };
                     println!(
-                        "{:<5} {:<24} {:<12} {:<20} {:<20} {}",
+                        "{:<5} {:<24} {:<12} {:<20} {:<20} {:<8} {}",
                         t.id, t.name, format!("{}…", t.prefix), t.created_at,
-                        t.last_used.as_deref().unwrap_or("never"), if t.revoked { "revoked" } else { "active" }
+                        t.last_used.as_deref().unwrap_or("never"), if t.revoked { "revoked" } else { "active" }, scope
                     );
                 }
             }
@@ -303,6 +382,54 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::Site { action } => match action {
+            SiteCmd::Add { name, subnets, description } => {
+                let nets = sites::parse_subnets(&subnets)?;
+                let id = db.add_site(&name, &sites::format_subnets(&nets), &description)?;
+                let s = db.get_site(id)?.context("site vanished")?;
+                println!("Site #{id} '{}' added: {} ({} existing assets placed)", s.name, s.subnets, s.asset_count);
+            }
+            SiteCmd::List => {
+                println!("{:<5} {:<24} {:>7} {:>7}  SUBNETS", "ID", "NAME", "ASSETS", "ONLINE");
+                for s in db.list_sites()? {
+                    println!("{:<5} {:<24} {:>7} {:>7}  {}", s.id, trunc(&s.name, 24), s.asset_count, s.online, s.subnets);
+                }
+                println!("{:<5} {:<24} {:>7}", "-", "(unassigned)", db.unassigned_count()?);
+            }
+            SiteCmd::Update { site, name, subnets, description } => {
+                let s = db.find_site(&site)?.with_context(|| format!("no site '{site}'"))?;
+                let subnets = match subnets {
+                    Some(x) => sites::format_subnets(&sites::parse_subnets(&x)?),
+                    None => s.subnets.clone(),
+                };
+                db.update_site(s.id, name.as_deref().unwrap_or(&s.name), &subnets, description.as_deref().unwrap_or(&s.description))?;
+                println!("Updated site #{}", s.id);
+            }
+            SiteCmd::Remove { site } => {
+                let s = db.find_site(&site)?.with_context(|| format!("no site '{site}'"))?;
+                db.delete_site(s.id)?;
+                println!("Removed site '{}'; its assets are now unassigned unless another site's subnets cover them.", s.name);
+            }
+            SiteCmd::Assign { asset, site, auto } => {
+                let a = match asset.parse::<i64>() {
+                    Ok(id) => db.get_asset(id)?,
+                    Err(_) => db.list_assets(&AssetFilter::default())?.into_iter().find(|a| a.ip == asset),
+                }
+                .with_context(|| format!("no asset '{asset}'"))?;
+                match (site, auto) {
+                    (_, true) => {
+                        db.set_asset_site(a.id, None)?;
+                        println!("Asset #{} returned to automatic site assignment", a.id);
+                    }
+                    (Some(s), false) => {
+                        let s = db.find_site(&s)?.with_context(|| format!("no site '{s}'"))?;
+                        db.set_asset_site(a.id, Some(s.id))?;
+                        println!("Asset #{} pinned to '{}'", a.id, s.name);
+                    }
+                    (None, false) => bail!("give a site name, or --auto"),
+                }
+            }
+        },
         Cmd::Schedule { action } => match action {
             ScheduleCmd::Add { name, targets, every } => {
                 scanner::targets::parse_targets(&targets)?;
@@ -333,14 +460,14 @@ fn trunc(s: &str, n: usize) -> String {
 
 fn print_assets(assets: &[db::Asset]) {
     println!(
-        "{:<5} {:<15} {:<22} {:<17} {:<16} {:<26} {:<18} {:>5} {:<7}",
-        "ID", "IP", "NAME", "MAC", "VENDOR", "TYPE", "OS", "PORTS", "STATUS"
+        "{:<5} {:<15} {:<22} {:<16} {:<17} {:<16} {:<26} {:<18} {:>5} {:<7}",
+        "ID", "IP", "NAME", "SITE", "MAC", "VENDOR", "TYPE", "OS", "PORTS", "STATUS"
     );
     for a in assets {
         let o = |v: &Option<String>, n| trunc(v.as_deref().unwrap_or("-"), n);
         println!(
-            "{:<5} {:<15} {:<22} {:<17} {:<16} {:<26} {:<18} {:>5} {:<7}",
-            a.id, a.ip, trunc(&a.display_name(), 22), o(&a.mac, 17), o(&a.vendor, 16),
+            "{:<5} {:<15} {:<22} {:<16} {:<17} {:<16} {:<26} {:<18} {:>5} {:<7}",
+            a.id, a.ip, trunc(&a.display_name(), 22), o(&a.site, 16), o(&a.mac, 17), o(&a.vendor, 16),
             o(&a.device_type, 26), o(&a.os_guess, 18), a.open_ports, a.status
         );
     }

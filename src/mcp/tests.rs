@@ -22,7 +22,7 @@ fn host(ip: &str, name: &str, mac: &str, dtype: &str, os: &str, ports: &[u16]) -
 
 fn server(allow_scans: bool) -> McpServer {
     let db = Db::open(":memory:").unwrap();
-    let scan = db.create_scan("10.0.0.0/24", "test").unwrap();
+    let scan = db.create_scan_for_site("10.0.0.0/24", "test", None).unwrap();
     for h in [
         host("10.0.0.10", "FRONTDESK-01", "00:14:22:00:00:01", "Windows Workstation", "Windows", &[135, 445, 3389]),
         host("10.0.0.11", "FRONTDESK-02", "00:14:22:00:00:02", "Windows Workstation", "Windows", &[135, 445]),
@@ -37,7 +37,7 @@ fn server(allow_scans: bool) -> McpServer {
 }
 
 async fn rpc(s: &McpServer, method: &str, params: Value) -> Value {
-    let ctx = CallContext { transport: "test", client: Some("tester".into()), remote_addr: None };
+    let ctx = CallContext { transport: "test", client: Some("tester".into()), remote_addr: None, scope: crate::query::Scope::all() };
     s.handle(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}), &ctx).await.unwrap()
 }
 
@@ -76,9 +76,11 @@ async fn initialize_and_list() {
 #[tokio::test]
 async fn sites_and_datasets() {
     let s = server(false);
+    // No sites defined yet: everything is "Unassigned", grouped by observed subnet.
     let r = tool(&s, "list_sites", json!({})).await;
+    assert_eq!(r["sites"][0]["name"], "Unassigned");
     assert_eq!(r["sites"][0]["asset_count"], 5);
-    assert_eq!(r["sites"][0]["subnets"][0]["subnet"], "10.0.0.0/24");
+    assert_eq!(r["sites"][0]["observed_subnets"][0]["subnet"], "10.0.0.0/24");
     let r = tool(&s, "search_datasets", json!({"keyword":"snmp"})).await;
     assert_eq!(r["datasets"][0]["dataset"], "assets");
 }
@@ -164,4 +166,93 @@ async fn catalog_assets_docs_prompts() {
     assert_eq!(r["error"]["code"], INVALID_PARAMS);
     let r = rpc(&s, "prompts/get", json!({"name":"new-device-review"})).await;
     assert!(r["result"]["messages"][0]["content"]["text"].as_str().unwrap().contains("now-7d"));
+}
+
+/// Two sites: Main Clinic 10.0.0.0/26 (.2 .10 .11 .50, and .60 if nothing more specific) and Imaging 10.0.0.60/32 (PACS).
+fn with_sites(s: &McpServer) -> (i64, i64) {
+    let db = &s.state.db;
+    let main = db.add_site("Main Clinic", "10.0.0.0/26", "").unwrap();
+    let imaging = db.add_site("Imaging", "10.0.0.60/32", "").unwrap();
+    (main, imaging)
+}
+
+fn scoped(sites: Option<Vec<i64>>) -> CallContext {
+    CallContext { transport: "test", client: Some("scoped".into()), remote_addr: None, scope: crate::query::Scope { sites } }
+}
+
+async fn tool_as(s: &McpServer, ctx: &CallContext, name: &str, args: Value) -> Value {
+    s.handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}), ctx).await.unwrap()["result"].clone()
+}
+
+#[tokio::test]
+async fn sites_assignment_and_site_filter() {
+    let s = server(false);
+    let (main, imaging) = with_sites(&s);
+    let r = tool(&s, "list_sites", json!({})).await;
+    let names: Vec<&str> = r["sites"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Imaging", "Main Clinic"], "no Unassigned entry when everything is placed");
+    assert_eq!(r["sites"][1]["asset_count"], 4);
+
+    let r = tool(&s, "execute_query", json!({"dataset":"assets","site":"main clinic","fields":["name","site"]})).await;
+    assert_eq!(r["total"], 4);
+    assert_eq!(r["rows"][0]["site"], "Main Clinic");
+    let r = tool(&s, "execute_query", json!({"dataset":"ports","site": imaging})).await;
+    assert_eq!(r["total"], 2);
+    let r = tool(&s, "search_query_catalog", json!({"run_id":"assets-by-type","site":"Imaging"})).await;
+    assert_eq!(r["result"]["groups"][0]["device_type"], "Medical / HL7-DICOM");
+    let r = tool(&s, "execute_query", json!({"dataset":"assets","group_by":"site"})).await;
+    assert_eq!(r["groups"][0]["site"], "Main Clinic");
+
+    // Manual pin survives re-assignment; deleting a site unassigns its assets.
+    let pacs = s.state.db.list_assets(&crate::db::AssetFilter { q: Some("PACS".into()), ..Default::default() }).unwrap()[0].id;
+    s.state.db.set_asset_site(pacs, Some(main)).unwrap();
+    s.state.db.reassign_sites().unwrap();
+    assert_eq!(s.state.db.get_asset(pacs).unwrap().unwrap().site_id, Some(main));
+    s.state.db.set_asset_site(pacs, None).unwrap();
+    assert_eq!(s.state.db.get_asset(pacs).unwrap().unwrap().site_id, Some(imaging));
+    // Deleting the more specific site falls back to the broader one (10.0.0.0/26 covers .60)…
+    s.state.db.delete_site(imaging).unwrap();
+    assert_eq!(s.state.db.get_asset(pacs).unwrap().unwrap().site_id, Some(main));
+    // …and deleting that leaves everything unassigned.
+    s.state.db.delete_site(main).unwrap();
+    assert_eq!(s.state.db.get_asset(pacs).unwrap().unwrap().site_id, None);
+    let r = tool(&s, "execute_query", json!({"dataset":"assets","site":"unassigned"})).await;
+    assert_eq!(r["total"], 5);
+}
+
+#[tokio::test]
+async fn site_scoped_tokens_are_enforced() {
+    let s = server(true);
+    let (main, imaging) = with_sites(&s);
+    let ctx = scoped(Some(vec![imaging]));
+
+    let r = tool_as(&s, &ctx, "list_sites", json!({})).await;
+    assert_eq!(r["structuredContent"]["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(r["structuredContent"]["sites"][0]["name"], "Imaging");
+
+    // Every dataset is filtered to the token's sites, even without a site argument.
+    let r = tool_as(&s, &ctx, "execute_query", json!({"dataset":"assets"})).await;
+    assert_eq!(r["structuredContent"]["total"], 1);
+    let r = tool_as(&s, &ctx, "execute_query", json!({"dataset":"ports","match_any":true,
+        "filters":[{"field":"port","op":"eq","value":3389},{"field":"port","op":"eq","value":104}]})).await;
+    assert_eq!(r["structuredContent"]["total"], 1, "OR filters can't escape the scope");
+    let r = tool_as(&s, &ctx, "execute_query", json!({"dataset":"changes","group_by":"asset_name"})).await;
+    assert_eq!(r["structuredContent"]["total_groups"], 1);
+    let r = tool_as(&s, &ctx, "execute_query", json!({"dataset":"scans"})).await;
+    assert_eq!(r["structuredContent"]["total"], 0, "unscoped scans are hidden");
+
+    // Asking for another site, unassigned assets, or another site's device is refused.
+    assert_eq!(tool_as(&s, &ctx, "execute_query", json!({"dataset":"assets","site": main})).await["isError"], true);
+    assert_eq!(tool_as(&s, &ctx, "execute_query", json!({"dataset":"assets","site":"unassigned"})).await["isError"], true);
+    assert_eq!(tool_as(&s, &ctx, "get_asset", json!({"name":"DC01"})).await["isError"], true);
+    let dc = s.state.db.list_assets(&crate::db::AssetFilter { q: Some("DC01".into()), ..Default::default() }).unwrap()[0].id;
+    assert_eq!(tool_as(&s, &ctx, "get_asset", json!({"id": dc})).await["isError"], true);
+    assert_eq!(tool_as(&s, &ctx, "asset_history", json!({"asset_id": dc})).await["isError"], true);
+    assert_eq!(tool_as(&s, &ctx, "get_asset", json!({"name":"PACS"})).await["isError"], false);
+    assert_eq!(tool_as(&s, &ctx, "scan_status", json!({})).await["isError"], true);
+    assert_eq!(tool_as(&s, &ctx, "start_scan", json!({"targets":"10.0.0.60"})).await["isError"], true);
+
+    // A token whose sites were all deleted sees nothing.
+    let none = scoped(Some(vec![]));
+    assert_eq!(tool_as(&s, &none, "execute_query", json!({"dataset":"assets"})).await["structuredContent"]["total"], 0);
 }

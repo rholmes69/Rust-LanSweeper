@@ -16,7 +16,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use crate::db::AssetFilter;
-use crate::query::{self, MCP_LIMITS};
+use crate::query::{self, Scope, MCP_LIMITS};
 use crate::web::{self, AppState};
 
 pub const SERVER_NAME: &str = "rustsweeper";
@@ -24,7 +24,7 @@ const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", 
 const FALLBACK_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "RustSweeper is an agentless network asset inventory (devices, open ports, \
-names, vendors, change history, scans). Suggested workflow: (1) list_sites to see what is inventoried; \
+names, vendors, change history, scans). Suggested workflow: (1) list_sites to see sites (locations) and their subnets; \
 (2) search_query_catalog for a ready-made query matching the question; (3) otherwise search_datasets to \
 find fields, then execute_query with filters. Results are capped at 20 rows per call (default 10) — page \
 with offset when has_more is true, or use group_by for counts. Use get_asset / asset_history for a single \
@@ -44,6 +44,8 @@ pub struct CallContext {
     /// Authenticated caller: token name (HTTP) or OS user (stdio).
     pub client: Option<String>,
     pub remote_addr: Option<String>,
+    /// Sites the caller may see (site-scoped API tokens).
+    pub scope: Scope,
 }
 
 fn rpc_result(id: &Value, result: Value) -> Value {
@@ -121,7 +123,7 @@ impl McpServer {
                     return Err(RpcError(INVALID_PARAMS, format!("unknown tool '{name}'")));
                 }
                 let started = std::time::Instant::now();
-                let res = self.call_tool(name, &args).await;
+                let res = self.call_tool(name, &args, &ctx.scope).await;
                 self.audit(ctx, "tools/call", Some(name), Some(&args), &res, started);
                 Ok(match res {
                     Ok(v) => json!({
@@ -168,6 +170,7 @@ impl McpServer {
                 "match_any": { "type": "boolean", "description": "OR the filters instead of AND" },
                 "sort": { "type": "object", "properties": { "field": {"type":"string"}, "desc": {"type":"boolean"} }, "required": ["field"] },
                 "group_by": { "type": "string", "description": "Return counts per value of this field instead of rows" },
+                "site": { "description": "Limit to one site: id or name from list_sites (or \"unassigned\")" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": MCP_LIMITS.max, "default": MCP_LIMITS.default },
                 "offset": { "type": "integer", "minimum": 0, "default": 0 }
             },
@@ -177,7 +180,7 @@ impl McpServer {
             json!({
                 "name": "list_sites",
                 "title": "List sites",
-                "description": "Start here. Lists the inventoried sites and the subnets/asset counts in each, plus database totals.",
+                "description": "Start here. Lists sites (locations such as clinics) with their subnets and asset counts, plus unassigned assets grouped by subnet. Use a site's id or name to scope other queries.",
                 "inputSchema": { "type": "object", "properties": {} },
                 "annotations": ro,
             }),
@@ -195,6 +198,7 @@ impl McpServer {
                 "inputSchema": { "type": "object", "properties": {
                     "query": { "type": "string", "description": "Keywords describing the question" },
                     "run_id": { "type": "string", "description": "Template id to execute immediately" },
+                    "site": { "description": "With run_id: limit results to this site (id or name)" },
                     "offset": { "type": "integer", "minimum": 0, "description": "Paging offset when using run_id" }
                 } },
                 "annotations": ro,
@@ -243,18 +247,18 @@ impl McpServer {
             tools.push(json!({
                 "name": "start_scan",
                 "title": "Start a network scan",
-                "description": "Start a discovery scan (runs in the background; poll scan_status). Targets: CIDR, ranges like 10.0.0.5-40, IPs or hostnames. Max 65,536 addresses. Only scan networks you are authorised to scan.",
-                "inputSchema": { "type": "object", "properties": { "targets": { "type": "string" } }, "required": ["targets"] },
+                "description": "Start a discovery scan (runs in the background; poll scan_status). Give `site` to scan all of a site's subnets, or `targets`: CIDR, ranges like 10.0.0.5-40, IPs or hostnames (max 65,536 addresses). Only scan networks you are authorised to scan.",
+                "inputSchema": { "type": "object", "properties": { "targets": { "type": "string" }, "site": { "description": "Site id or name" } } },
                 "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
             }));
         }
         tools
     }
 
-    pub async fn call_tool(&self, name: &str, args: &Value) -> Result<Value> {
+    pub async fn call_tool(&self, name: &str, args: &Value, scope: &Scope) -> Result<Value> {
         let db = &self.state.db;
         match name {
-            "list_sites" => list_sites(&self.state),
+            "list_sites" => list_sites(&self.state, scope),
             "search_datasets" => Ok(query::describe(args.get("keyword").and_then(|v| v.as_str()))),
             "search_query_catalog" => {
                 if let Some(id) = args.get("run_id").and_then(|v| v.as_str()) {
@@ -263,33 +267,39 @@ impl McpServer {
                     if let Some(o) = args.get("offset").and_then(|v| v.as_i64()) {
                         q.offset = Some(o);
                     }
-                    let result = query::execute(db, &q, MCP_LIMITS)?;
+                    if let Some(site) = args.get("site").filter(|v| !v.is_null()) {
+                        q.site = Some(site.clone());
+                    }
+                    let result = query::execute(db, &q, MCP_LIMITS, scope)?;
                     return Ok(json!({ "template": t.id, "title": t.title, "result": result }));
                 }
                 let hits = catalog::search(args.get("query").and_then(|v| v.as_str()));
                 Ok(json!({
                     "count": hits.len(),
                     "templates": hits,
-                    "hint": "Run one with search_query_catalog {run_id}, or pass its 'query' (adjusted as needed) to execute_query.",
+                    "hint": "Run one with search_query_catalog {run_id, site?}, or pass its 'query' (adjusted as needed) to execute_query.",
                 }))
             }
             "execute_query" => {
                 let q = query::parse(args.clone())?;
-                query::execute(db, &q, MCP_LIMITS)
+                query::execute(db, &q, MCP_LIMITS, scope)
             }
-            "get_asset" => get_asset(&self.state, args),
+            "get_asset" => get_asset(&self.state, args, scope),
             "asset_history" => {
                 let id = args.get("asset_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("asset_id is required"))?;
                 let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(25).clamp(1, 100);
-                let a = db.get_asset(id)?.ok_or_else(|| anyhow!("no asset {id}"))?;
-                Ok(json!({ "asset_id": id, "name": a.display_name(), "changes": db.changes(Some(id), limit)? }))
+                let a = db.get_asset(id)?.filter(|a| scope.allows(a.site_id)).ok_or_else(|| anyhow!("no asset {id}"))?;
+                Ok(json!({ "asset_id": id, "name": a.display_name(), "site": a.site, "changes": db.changes(Some(id), limit)? }))
             }
             "scan_status" => {
                 let scan = match args.get("scan_id").and_then(|v| v.as_i64()) {
                     Some(id) => db.get_scan(id)?,
-                    None => db.list_scans(1)?.into_iter().next(),
+                    None => db.list_scans(500)?.into_iter().find(|s| scope.allows(s.site_id)),
                 };
-                let scan = scan.ok_or_else(|| anyhow!("no such scan (no scans have run yet?)"))?;
+                // Site-scoped tokens only see scans that were run for one of their sites.
+                let scan = scan
+                    .filter(|s| scope.allows(s.site_id))
+                    .ok_or_else(|| anyhow!("no such scan (or no scans have run yet)"))?;
                 let progress = self.state.progress_of(scan.id).map(|p| {
                     json!({
                         "total": p.total.load(Ordering::Relaxed),
@@ -301,9 +311,22 @@ impl McpServer {
             }
             "docs" => Ok(docs(args.get("query").and_then(|v| v.as_str()))),
             "start_scan" if self.allow_scans => {
-                let targets = args.get("targets").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("targets is required"))?;
-                let id = web::launch_scan(&self.state, targets, "mcp")?;
-                Ok(json!({ "scan_id": id, "status": "running", "hint": "Poll scan_status with this scan_id." }))
+                if scope.is_restricted() {
+                    bail!("site-scoped tokens cannot start scans");
+                }
+                let (targets, site_id) = match args.get("site").filter(|v| !v.is_null()) {
+                    Some(site) => {
+                        let id = query::resolve_site(db, site)?.ok_or_else(|| anyhow!("pick a named site to scan"))?;
+                        let s = db.get_site(id)?.ok_or_else(|| anyhow!("site vanished"))?;
+                        (s.subnets.replace(' ', ""), Some(id))
+                    }
+                    None => (
+                        args.get("targets").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("give targets or site"))?.to_string(),
+                        None,
+                    ),
+                };
+                let id = web::launch_scan_for_site(&self.state, &targets, "mcp", site_id)?;
+                Ok(json!({ "scan_id": id, "targets": targets, "status": "running", "hint": "Poll scan_status with this scan_id." }))
             }
             other => bail!("unknown tool '{other}'"),
         }
@@ -348,41 +371,56 @@ impl McpServer {
 
 pub struct RpcError(pub i64, pub String);
 
-fn list_sites(state: &AppState) -> Result<Value> {
-    let assets = state.db.list_assets(&AssetFilter::default())?;
-    let mut subnets: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
-    for a in &assets {
-        if let Ok(std::net::IpAddr::V4(v4)) = a.ip.parse::<std::net::IpAddr>() {
-            let net = u32::from(v4) & 0xFFFF_FF00;
-            let e = subnets.entry(net).or_default();
-            e.0 += 1;
-            if a.status == "online" {
-                e.1 += 1;
+fn list_sites(state: &AppState, scope: &Scope) -> Result<Value> {
+    let db = &state.db;
+    let mut sites: Vec<Value> = db
+        .list_sites()?
+        .into_iter()
+        .filter(|s| scope.allows(Some(s.id)))
+        .map(|s| {
+            json!({
+                "id": s.id, "name": s.name, "description": s.description,
+                "subnets": s.subnets.split(", ").collect::<Vec<_>>(),
+                "asset_count": s.asset_count, "online": s.online, "offline": s.asset_count - s.online,
+            })
+        })
+        .collect();
+    if !scope.is_restricted() {
+        let unassigned = db.list_assets(&AssetFilter { site_id: Some(0), ..Default::default() })?;
+        if !unassigned.is_empty() || sites.is_empty() {
+            // Group unassigned assets by /24 so the assistant can suggest site definitions.
+            let mut nets: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+            for a in &unassigned {
+                if let Ok(std::net::IpAddr::V4(v4)) = a.ip.parse::<std::net::IpAddr>() {
+                    let e = nets.entry(u32::from(v4) & 0xFFFF_FF00).or_default();
+                    e.0 += 1;
+                    e.1 += (a.status == "online") as usize;
+                }
             }
+            sites.push(json!({
+                "id": 0, "name": "Unassigned",
+                "description": "Assets whose IP is not inside any site's subnets",
+                "asset_count": unassigned.len(),
+                "online": unassigned.iter().filter(|a| a.status == "online").count(),
+                "observed_subnets": nets.iter().map(|(n, (c, on))| json!({
+                    "subnet": format!("{}/24", std::net::Ipv4Addr::from(*n)), "assets": c, "online": on
+                })).collect::<Vec<_>>(),
+            }));
         }
     }
-    let stats = state.db.stats()?;
-    let last_scan = state.db.list_scans(1)?.into_iter().next();
+    let last_scan = db.list_scans(500)?.into_iter().find(|s| scope.allows(s.site_id));
     Ok(json!({
-        "sites": [{
-            "id": "default",
-            "name": "Default site",
-            "asset_count": stats.total,
-            "online": stats.online,
-            "offline": stats.offline,
-            "subnets": subnets.iter().map(|(n, (c, on))| json!({
-                "subnet": format!("{}/24", std::net::Ipv4Addr::from(*n)), "assets": c, "online": on
-            })).collect::<Vec<_>>(),
-        }],
+        "sites": sites,
+        "scoped": scope.is_restricted(),
         "last_scan": last_scan,
-        "note": "Multi-site support (clinic locations) is planned; all assets currently belong to the default site.",
+        "hint": "Pass a site's id or name as `site` to execute_query or search_query_catalog to limit results to it.",
     }))
 }
 
-fn get_asset(state: &AppState, args: &Value) -> Result<Value> {
+fn get_asset(state: &AppState, args: &Value, scope: &Scope) -> Result<Value> {
     let db = &state.db;
     let asset = if let Some(id) = args.get("id").and_then(|v| v.as_i64()) {
-        db.get_asset(id)?
+        db.get_asset(id)?.filter(|a| scope.allows(a.site_id))
     } else {
         let needle = args
             .get("ip")
@@ -391,7 +429,7 @@ fn get_asset(state: &AppState, args: &Value) -> Result<Value> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("provide id, ip or name"))?;
-        let all = db.list_assets(&AssetFilter { q: Some(needle.clone()), ..Default::default() })?;
+        let all = db.list_assets(&AssetFilter { q: Some(needle.clone()), allowed_sites: scope.sites.clone(), ..Default::default() })?;
         let exact: Vec<_> = all
             .iter()
             .filter(|a| {
@@ -410,7 +448,7 @@ fn get_asset(state: &AppState, args: &Value) -> Result<Value> {
                 let c = if exact.is_empty() { &all } else { &exact };
                 return Ok(json!({
                     "ambiguous": true,
-                    "candidates": c.iter().take(20).map(|a| json!({"id": a.id, "ip": a.ip, "name": a.display_name(), "device_type": a.device_type})).collect::<Vec<_>>(),
+                    "candidates": c.iter().take(20).map(|a| json!({"id": a.id, "ip": a.ip, "name": a.display_name(), "site": a.site, "device_type": a.device_type})).collect::<Vec<_>>(),
                     "hint": "Call get_asset again with one of these ids.",
                 }));
             }
