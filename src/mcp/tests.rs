@@ -37,7 +37,7 @@ fn server(allow_scans: bool) -> McpServer {
 }
 
 async fn rpc(s: &McpServer, method: &str, params: Value) -> Value {
-    let ctx = CallContext { transport: "test", client: None };
+    let ctx = CallContext { transport: "test", client: Some("tester".into()), remote_addr: None };
     s.handle(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}), &ctx).await.unwrap()
 }
 

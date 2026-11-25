@@ -8,7 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use super::{rpc_error, CallContext, McpServer, PARSE_ERROR};
 
 pub async fn serve(server: McpServer) -> Result<()> {
-    let ctx = CallContext { transport: "stdio", client: None };
+    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok();
+    let ctx = CallContext { transport: "stdio", client: user, remote_addr: None };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut out = tokio::io::stdout();
     tracing::info!("MCP server ready on stdio (read-only{})", if server.allow_scans { ", scans enabled" } else { "" });
