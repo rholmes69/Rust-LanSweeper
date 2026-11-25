@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/schedules/{id}/toggle", post(toggle_schedule))
         .route("/schedules/{id}/delete", post(delete_schedule))
         .route("/changes", get(changes_page))
+        .route("/ai-access", get(ai_access_page))
         .route("/export.csv", get(export_csv))
         .route("/api/stats", get(api_stats))
         .route("/api/assets", get(api_assets))
@@ -213,7 +214,7 @@ fn page(title: &str, active: &str, body: String) -> Html<String> {
 
 fn page_ext(title: &str, active: &str, body: String, head_extra: &str) -> Html<String> {
     let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("scans", "/scans", "Scans"),
-        ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes")]
+        ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes"), ("ai", "/ai-access", "AI access")]
         .iter()
         .map(|(k, href, label)| {
             format!("<a href='{href}' class='{}'>{label}</a>", if *k == active { "active" } else { "" })
@@ -681,6 +682,54 @@ async fn changes_page(State(st): State<AppState>) -> WebResult<Html<String>> {
         "changes",
         format!("<h1>Change log</h1><div class=card style='overflow-x:auto'>{}</div>", changes_table(&changes, true)),
     ))
+}
+
+async fn ai_access_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let tokens: String = st
+        .db
+        .list_tokens()?
+        .iter()
+        .map(|t| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td class=mono>{}…</td><td class=muted>{}</td><td class=muted>{}</td><td>{}</td></tr>",
+                t.id, esc(&t.name), esc(&t.prefix), esc(&t.created_at), opt(&t.last_used),
+                if t.revoked { status_pill("offline").replace("offline", "revoked") } else { status_pill("online").replace("online", "active") }
+            )
+        })
+        .collect();
+    let audit: String = st
+        .db
+        .list_audit(300)?
+        .iter()
+        .map(|a| {
+            let args = a.arguments.as_deref().unwrap_or("");
+            let short: String = args.chars().take(160).collect();
+            format!(
+                "<tr><td class=muted style='white-space:nowrap'>{}</td><td>{}</td><td>{}</td><td class=mono>{}</td><td>{}</td><td class=mono title='{}'>{}{}</td><td>{}</td><td>{}</td><td class=muted>{} ms</td></tr>",
+                esc(&a.at), esc(&a.transport), opt(&a.client), opt(&a.remote_addr),
+                esc(a.tool.as_deref().unwrap_or(&a.method)), esc(args), esc(&short), if args.chars().count() > 160 { "…" } else { "" },
+                if a.ok { status_pill("online").replace("online", "ok") } else { format!("<span class='pill bad' title='{}'>error</span>", esc(a.error.as_deref().unwrap_or(""))) },
+                a.rows.map(|r| r.to_string()).unwrap_or_default(), a.duration_ms
+            )
+        })
+        .collect();
+    let body = format!(
+        "<h1>AI access (MCP)</h1>\
+         <div class=card><h2>How to connect</h2>\
+         <p>Local assistants (Claude Desktop, Claude Code, Cursor) can launch <code>rustsweeper mcp</code> over stdio. \
+         Remote clients connect to <code>/mcp</code> on this server with an API token:</p>\
+         <pre class=mono style='background:#f3f4f6;padding:10px;border-radius:6px'>rustsweeper token create \"claude-desktop\"\nAuthorization: Bearer rsw_…</pre>\
+         <p class=hint>The MCP server is read-only unless started with --allow-scans / --mcp-allow-scans. Every call is logged below. \
+         Check your organization's AI-use policy before connecting third-party assistants.</p></div>\
+         <div class=card style='padding:0;overflow-x:auto'><h2 style='padding:16px 16px 0'>API tokens</h2>\
+         <table><tr><th>ID</th><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th><th>State</th></tr>{}</table>\
+         <p class=hint style='padding:0 16px 12px'>Create and revoke tokens with <code>rustsweeper token create|revoke</code>.</p></div>\
+         <div class=card style='padding:0;overflow-x:auto'><h2 style='padding:16px 16px 0'>Audit log</h2>\
+         <table><tr><th>When</th><th>Via</th><th>Client</th><th>From</th><th>Tool</th><th>Arguments</th><th>Result</th><th>Rows</th><th>Time</th></tr>{}</table></div>",
+        if tokens.is_empty() { "<tr><td colspan=6 class=muted>No tokens</td></tr>".into() } else { tokens },
+        if audit.is_empty() { "<tr><td colspan=9 class=muted>No MCP calls yet</td></tr>".into() } else { audit },
+    );
+    Ok(page("AI access", "ai", body))
 }
 
 // ---------------------------------------------------------------- CSV export

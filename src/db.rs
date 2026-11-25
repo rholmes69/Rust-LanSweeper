@@ -76,6 +76,32 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 CREATE INDEX IF NOT EXISTS idx_changes_asset ON changes(asset_id);
 
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    token_hash  TEXT NOT NULL UNIQUE,
+    prefix      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    last_used   TEXT,
+    revoked     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS mcp_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    at           TEXT NOT NULL,
+    transport    TEXT NOT NULL,
+    client       TEXT,
+    remote_addr  TEXT,
+    method       TEXT NOT NULL,
+    tool         TEXT,
+    arguments    TEXT,
+    ok           INTEGER NOT NULL,
+    error        TEXT,
+    rows         INTEGER,
+    duration_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_at ON mcp_audit(at);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -182,6 +208,47 @@ pub struct Stats {
     pub new_7d: i64,
     pub by_type: Vec<(String, i64)>,
     pub by_vendor: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiToken {
+    pub id: i64,
+    pub name: String,
+    /// First characters of the token, for identification only.
+    pub prefix: String,
+    pub created_at: String,
+    pub last_used: Option<String>,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: String,
+    pub transport: String,
+    pub client: Option<String>,
+    pub remote_addr: Option<String>,
+    pub method: String,
+    pub tool: Option<String>,
+    pub arguments: Option<String>,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub rows: Option<i64>,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewAudit<'a> {
+    pub transport: &'a str,
+    pub client: Option<&'a str>,
+    pub remote_addr: Option<&'a str>,
+    pub method: &'a str,
+    pub tool: Option<&'a str>,
+    pub arguments: Option<String>,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub rows: Option<i64>,
+    pub duration_ms: i64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -660,5 +727,97 @@ impl Db {
         self.lock()
             .execute("UPDATE schedules SET last_run=?1 WHERE id=?2", params![now(), id])?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------------- API tokens
+
+    pub fn create_token(&self, name: &str, token_hash: &str, prefix: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO api_tokens (name, token_hash, prefix, created_at) VALUES (?1,?2,?3,?4)",
+            params![name, token_hash, prefix, now()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_tokens(&self) -> Result<Vec<ApiToken>> {
+        let conn = self.lock();
+        let mut st = conn.prepare("SELECT id, name, prefix, created_at, last_used, revoked FROM api_tokens ORDER BY id")?;
+        let rows = st.query_map([], |r| {
+            Ok(ApiToken {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                prefix: r.get(2)?,
+                created_at: r.get(3)?,
+                last_used: r.get(4)?,
+                revoked: r.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Look up an active token by hash; records last use. Returns (id, name).
+    pub fn token_by_hash(&self, token_hash: &str) -> Result<Option<(i64, String)>> {
+        let conn = self.lock();
+        let found: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, name FROM api_tokens WHERE token_hash=?1 AND revoked=0",
+                [token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, _)) = &found {
+            conn.execute("UPDATE api_tokens SET last_used=?1 WHERE id=?2", params![now(), id])?;
+        }
+        Ok(found)
+    }
+
+    pub fn active_token_count(&self) -> Result<i64> {
+        Ok(self.lock().query_row("SELECT COUNT(*) FROM api_tokens WHERE revoked=0", [], |r| r.get(0))?)
+    }
+
+    /// Revoke by id or name. Returns true if a token was revoked.
+    pub fn revoke_token(&self, id_or_name: &str) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE api_tokens SET revoked=1 WHERE revoked=0 AND (CAST(id AS TEXT)=?1 OR name=?1)",
+            [id_or_name],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---------------------------------------------------------------- MCP audit log
+
+    pub fn add_audit(&self, a: &NewAudit) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO mcp_audit (at, transport, client, remote_addr, method, tool, arguments, ok, error, rows, duration_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![now(), a.transport, a.client, a.remote_addr, a.method, a.tool, a.arguments, a.ok as i64, a.error, a.rows, a.duration_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_audit(&self, limit: i64) -> Result<Vec<AuditEntry>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT id, at, transport, client, remote_addr, method, tool, arguments, ok, error, rows, duration_ms \
+             FROM mcp_audit ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = st.query_map([limit], |r| {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                transport: r.get(2)?,
+                client: r.get(3)?,
+                remote_addr: r.get(4)?,
+                method: r.get(5)?,
+                tool: r.get(6)?,
+                arguments: r.get(7)?,
+                ok: r.get::<_, i64>(8)? != 0,
+                error: r.get(9)?,
+                rows: r.get(10)?,
+                duration_ms: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }

@@ -5,6 +5,7 @@
 //! JSON-RPC 2.0 is implemented directly; transports live in `stdio.rs` (and `http.rs`).
 
 pub mod catalog;
+pub mod http;
 pub mod prompts;
 pub mod stdio;
 
@@ -40,9 +41,9 @@ pub struct McpServer {
 #[derive(Debug, Clone, Default)]
 pub struct CallContext {
     pub transport: &'static str,
-    /// Authenticated caller (token name) when the transport knows it.
-    #[allow(dead_code)] // used by the HTTP transport's audit log
+    /// Authenticated caller: token name (HTTP) or OS user (stdio).
     pub client: Option<String>,
+    pub remote_addr: Option<String>,
 }
 
 fn rpc_result(id: &Value, result: Value) -> Value {
@@ -97,6 +98,8 @@ impl McpServer {
     async fn dispatch(&self, method: &str, params: &Value, ctx: &CallContext) -> Result<Value, RpcError> {
         match method {
             "initialize" => {
+                let client_info = params.get("clientInfo").cloned().unwrap_or(Value::Null);
+                self.audit(ctx, "initialize", None, Some(&client_info), &Ok(Value::Null), std::time::Instant::now());
                 let requested = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(FALLBACK_VERSION);
                 let version = if SUPPORTED_VERSIONS.contains(&requested) { requested } else { FALLBACK_VERSION };
                 Ok(json!({
@@ -117,8 +120,9 @@ impl McpServer {
                 if !self.tool_defs().iter().any(|t| t["name"] == name) {
                     return Err(RpcError(INVALID_PARAMS, format!("unknown tool '{name}'")));
                 }
+                let started = std::time::Instant::now();
                 let res = self.call_tool(name, &args).await;
-                tracing::debug!(transport = ctx.transport, tool = name, ok = res.is_ok(), "mcp tool call");
+                self.audit(ctx, "tools/call", Some(name), Some(&args), &res, started);
                 Ok(match res {
                     Ok(v) => json!({
                         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }],
@@ -303,6 +307,42 @@ impl McpServer {
             }
             other => bail!("unknown tool '{other}'"),
         }
+    }
+}
+
+impl McpServer {
+    /// Record an MCP call in the audit log (never fails the request).
+    fn audit(&self, ctx: &CallContext, method: &str, tool: Option<&str>, args: Option<&Value>, res: &Result<Value>, started: std::time::Instant) {
+        let mut arguments = args.map(|a| a.to_string());
+        if let Some(a) = &mut arguments {
+            if a.len() > 2000 {
+                let mut cut = 2000;
+                while !a.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                a.truncate(cut);
+                a.push('…');
+            }
+        }
+        let rows = res.as_ref().ok().and_then(|v| {
+            v.get("returned").or_else(|| v.get("result").and_then(|r| r.get("returned"))).and_then(|n| n.as_i64())
+        });
+        let entry = crate::db::NewAudit {
+            transport: ctx.transport,
+            client: ctx.client.as_deref(),
+            remote_addr: ctx.remote_addr.as_deref(),
+            method,
+            tool,
+            arguments,
+            ok: res.is_ok(),
+            error: res.as_ref().err().map(|e| format!("{e:#}")),
+            rows,
+            duration_ms: started.elapsed().as_millis() as i64,
+        };
+        if let Err(e) = self.state.db.add_audit(&entry) {
+            tracing::warn!("could not write MCP audit entry: {e:#}");
+        }
+        tracing::info!(transport = ctx.transport, client = ?ctx.client, method, tool, ok = res.is_ok(), "mcp call");
     }
 }
 

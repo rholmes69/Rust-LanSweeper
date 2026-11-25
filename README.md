@@ -52,6 +52,10 @@ rustsweeper serve --bind 0.0.0.0:8080 --auth admin:S3cret!
 # One-off scan from the command line
 rustsweeper scan 10.10.0.0/24 10.10.5.10-60 printer01
 
+# MCP access tokens and audit log
+rustsweeper token create "claude-desktop"
+rustsweeper audit
+
 # Query the inventory
 rustsweeper assets --search printer
 rustsweeper assets --csv > inventory.csv
@@ -129,6 +133,30 @@ claude mcp add rustsweeper -- C:\RustSweeper\rustsweeper.exe --db C:\RustSweeper
 
 **Cursor** (`.cursor/mcp.json`): same `command`/`args` block as Claude Desktop.
 
+**Remote access over HTTP.** `rustsweeper serve` also exposes the MCP server at `/mcp`
+(Streamable HTTP), for assistants that can't launch a local process or for a shared server:
+
+```sh
+rustsweeper token create "claude-desktop"     # prints rsw_… once — store it in the client config
+rustsweeper token list
+rustsweeper token revoke claude-desktop       # live sessions stop immediately
+rustsweeper serve --bind 0.0.0.0:8080 --auth admin:CHANGE_ME
+```
+
+Clients send `Authorization: Bearer rsw_…` to `http://<server>:8080/mcp`. For example, Claude Code:
+
+```sh
+claude mcp add --transport http rustsweeper http://inventory01:8080/mcp --header "Authorization: Bearer rsw_…"
+```
+
+- Tokens are random 256-bit values; only a SHA-256 hash is stored.
+- Sessions are tied to the token that opened them and expire after 60 minutes idle.
+- Browser requests from foreign origins are rejected (DNS-rebinding protection).
+- Every MCP call (stdio and HTTP) is written to an audit log: who, from where, which tool, the
+  arguments, rows returned and duration. See the **AI access** page or `rustsweeper audit`.
+- `--mcp-allow-scans` exposes `start_scan`; `--no-mcp` turns the endpoint off; `--mcp-no-auth`
+  skips tokens but is only allowed when bound to 127.0.0.1.
+
 The MCP server reads the same database as `serve`, so you can run both at once. Before connecting a
 third-party AI assistant, check that it's allowed under your organization's AI-use policy — asset data
 (names, IPs, notes) is sent to the assistant when it answers.
@@ -181,6 +209,8 @@ src/
     catalog.rs         pre-built query templates
     prompts.rs         MCP prompts (IT workflows)
     stdio.rs           stdio transport
+    http.rs            Streamable HTTP transport (/mcp), sessions, Origin checks
+  auth.rs              API tokens for /mcp
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

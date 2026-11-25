@@ -1,5 +1,6 @@
 //! RustSweeper — an agentless, Lansweeper-style network asset inventory written in Rust.
 
+mod auth;
 mod db;
 mod mcp;
 mod query;
@@ -73,9 +74,18 @@ enum Cmd {
         /// Address to listen on. Use 0.0.0.0:8080 to allow other machines.
         #[arg(long, default_value = "127.0.0.1:8080", env = "RUSTSWEEPER_BIND")]
         bind: SocketAddr,
-        /// Require HTTP basic auth, as user:password.
+        /// Require HTTP basic auth for the dashboard and REST API, as user:password.
         #[arg(long, env = "RUSTSWEEPER_AUTH")]
         auth: Option<String>,
+        /// Disable the MCP endpoint at /mcp.
+        #[arg(long)]
+        no_mcp: bool,
+        /// Expose the start_scan tool on /mcp.
+        #[arg(long)]
+        mcp_allow_scans: bool,
+        /// Allow /mcp without a bearer token (only permitted when bound to localhost).
+        #[arg(long)]
+        mcp_no_auth: bool,
         #[command(flatten)]
         scan: ScanArgs,
     },
@@ -112,11 +122,30 @@ enum Cmd {
     Show { asset: String },
     /// List recent scans.
     Scans,
+    /// Manage API tokens for the /mcp HTTP endpoint.
+    Token {
+        #[command(subcommand)]
+        action: TokenCmd,
+    },
+    /// Show the most recent MCP (AI assistant) calls.
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Manage scheduled scans.
     Schedule {
         #[command(subcommand)]
         action: ScheduleCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Create a token (shown once — store it in your MCP client config).
+    Create { name: String },
+    List,
+    /// Revoke by id or name. Active sessions using it stop working immediately.
+    Revoke { id_or_name: String },
 }
 
 #[derive(Subcommand)]
@@ -149,7 +178,7 @@ async fn main() -> Result<()> {
     let db = Db::open(&cli.db).with_context(|| format!("opening database {}", cli.db))?;
 
     match cli.cmd {
-        Cmd::Serve { bind, auth, scan } => {
+        Cmd::Serve { bind, auth, no_mcp, mcp_allow_scans, mcp_no_auth, scan } => {
             let auth = match auth {
                 Some(s) => match s.split_once(':') {
                     Some((u, p)) if !u.is_empty() && !p.is_empty() => Some((u.to_string(), p.to_string())),
@@ -160,12 +189,25 @@ async fn main() -> Result<()> {
             if auth.is_none() && !bind.ip().is_loopback() {
                 tracing::warn!("listening on {bind} without --auth: anyone on the network can view the inventory");
             }
-            let state = web::AppState::new(db, scan.options(), auth);
+            if mcp_no_auth && !bind.ip().is_loopback() {
+                bail!("--mcp-no-auth is only allowed when --bind is a loopback address (127.0.0.1)");
+            }
+            let state = web::AppState::new(db.clone(), scan.options(), auth);
             tokio::spawn(web::scheduler(state.clone()));
-            let app = web::router(state);
+            let mut app = web::router(state.clone());
+            if !no_mcp {
+                let server = mcp::McpServer::new(state, mcp_allow_scans);
+                app = app.merge(mcp::http::router(mcp::http::HttpMcp::new(server, !mcp_no_auth)));
+                if !mcp_no_auth && db.active_token_count()? == 0 {
+                    tracing::warn!("MCP endpoint /mcp has no API tokens yet; create one with `rustsweeper token create <name>`");
+                }
+            }
             let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
             println!("RustSweeper dashboard: http://{bind}/");
-            axum::serve(listener, app).await?;
+            if !no_mcp {
+                println!("MCP endpoint:          http://{bind}/mcp{}", if mcp_no_auth { " (no auth)" } else { " (bearer token)" });
+            }
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
         }
         Cmd::Mcp { allow_scans, scan } => {
             let state = web::AppState::new(db, scan.options(), None);
@@ -224,6 +266,41 @@ async fn main() -> Result<()> {
             println!("{:<6} {:<10} {:<6} {:<6} {:<20} TARGETS", "ID", "STATUS", "UP", "NEW", "STARTED");
             for s in db.list_scans(50)? {
                 println!("{:<6} {:<10} {:<6} {:<6} {:<20} {}", s.id, s.status, s.hosts_up, s.new_assets, s.started_at, s.targets);
+            }
+        }
+        Cmd::Token { action } => match action {
+            TokenCmd::Create { name } => {
+                let (id, token) = auth::create(&db, &name)?;
+                println!("Token #{id} '{name}' created. Copy it now — it will not be shown again:\n\n  {token}\n");
+                println!("Use it as an HTTP header in your MCP client:  Authorization: Bearer {token}");
+            }
+            TokenCmd::List => {
+                println!("{:<5} {:<24} {:<12} {:<20} {:<20} STATE", "ID", "NAME", "PREFIX", "CREATED", "LAST USED");
+                for t in db.list_tokens()? {
+                    println!(
+                        "{:<5} {:<24} {:<12} {:<20} {:<20} {}",
+                        t.id, t.name, format!("{}…", t.prefix), t.created_at,
+                        t.last_used.as_deref().unwrap_or("never"), if t.revoked { "revoked" } else { "active" }
+                    );
+                }
+            }
+            TokenCmd::Revoke { id_or_name } => {
+                if db.revoke_token(&id_or_name)? {
+                    println!("Revoked {id_or_name}");
+                } else {
+                    bail!("no active token '{id_or_name}'");
+                }
+            }
+        },
+        Cmd::Audit { limit } => {
+            println!("{:<20} {:<6} {:<16} {:<15} {:<22} {:<4} {:>6} ARGUMENTS", "WHEN", "VIA", "CLIENT", "FROM", "TOOL", "OK", "ROWS");
+            for a in db.list_audit(limit)? {
+                println!(
+                    "{:<20} {:<6} {:<16} {:<15} {:<22} {:<4} {:>6} {}",
+                    a.at, a.transport, trunc(a.client.as_deref().unwrap_or("-"), 16), a.remote_addr.as_deref().unwrap_or("-"),
+                    a.tool.as_deref().unwrap_or(&a.method), if a.ok { "yes" } else { "NO" },
+                    a.rows.map(|r| r.to_string()).unwrap_or_default(), trunc(a.arguments.as_deref().unwrap_or(""), 80)
+                );
             }
         }
         Cmd::Schedule { action } => match action {
