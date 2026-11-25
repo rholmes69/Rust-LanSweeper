@@ -2,6 +2,7 @@
 
 mod auth;
 mod db;
+mod import;
 mod mcp;
 mod query;
 mod scanner;
@@ -125,6 +126,39 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Set asset details, e.g. `set 10.0.0.25 owner="Jane Doe" department=Billing warranty_end=2027-06-30`.
+    /// Use `custom:Field=value` for custom fields, an empty value to clear.
+    Set {
+        /// Asset id, IP, MAC or name.
+        asset: String,
+        /// field=value pairs.
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Add a device the scanner can't see (laptop off-site, spare stock…).
+    Add {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        ip: Option<String>,
+        #[arg(long)]
+        mac: Option<String>,
+    },
+    /// Import asset details from CSV (match by id, asset_tag, serial_number, mac, ip or name).
+    Import {
+        file: std::path::PathBuf,
+        /// Create assets for rows that match nothing.
+        #[arg(long)]
+        create: bool,
+        /// Show what would change without saving.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage custom asset fields.
+    Field {
+        #[command(subcommand)]
+        action: FieldCmd,
+    },
     /// Show full details for one asset (by id or IP).
     Show { asset: String },
     /// List recent scans.
@@ -163,6 +197,14 @@ enum TokenCmd {
     List,
     /// Revoke by id or name. Active sessions using it stop working immediately.
     Revoke { id_or_name: String },
+}
+
+#[derive(Subcommand)]
+enum FieldCmd {
+    Add { name: String },
+    List,
+    /// Delete a custom field and its values on every asset.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -298,13 +340,76 @@ async fn main() -> Result<()> {
             };
             let assets = db.list_assets(&AssetFilter { q: search, site_id, ..Default::default() })?;
             if csv {
-                print!("{}", web::assets_csv(&assets));
+                print!("{}", web::assets_csv(&db, &assets)?);
             } else if json {
                 println!("{}", serde_json::to_string_pretty(&assets)?);
             } else {
                 print_assets(&assets);
             }
         }
+        Cmd::Set { asset, values } => {
+            let a = find_asset(&db, &asset)?;
+            let mut edits = Vec::new();
+            let mut custom = Vec::new();
+            for kv in &values {
+                let (k, v) = kv.split_once('=').with_context(|| format!("'{kv}' should be field=value"))?;
+                let k = k.trim();
+                if let Some(name) = k.strip_prefix("custom:") {
+                    custom.push((name.to_string(), Some(v.trim().to_string()).filter(|s| !s.is_empty())));
+                } else if db::EDITABLE_FIELDS.iter().any(|(c, _)| *c == k) {
+                    edits.push((k.to_string(), db::normalize_field(k, v).with_context(|| k.to_string())?));
+                } else {
+                    bail!("'{k}' is not editable. Fields: {}", db::EDITABLE_FIELDS.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", "));
+                }
+            }
+            let mut n = db.update_asset_fields(a.id, &edits)?;
+            for (name, v) in custom {
+                n += db.set_custom_value(a.id, &name, v.as_deref())? as usize;
+            }
+            println!("Asset #{} '{}': {n} field(s) changed", a.id, a.display_name());
+        }
+        Cmd::Add { name, ip, mac } => {
+            let id = db.create_manual_asset(ip.as_deref(), mac.as_deref(), name.as_deref(), "manual")?;
+            println!("Added asset #{id}. Fill in details with: rustsweeper set {id} owner=... serial_number=...");
+        }
+        Cmd::Import { file, create, dry_run } => {
+            let data = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let data = String::from_utf8_lossy(&data);
+            let opts = import::ImportOptions { create_missing: create, dry_run, source: "import".into() };
+            let r = import::import_csv(&db, &data, &opts)?;
+            println!(
+                "{}{} rows: {} matched, {} created, {} assets updated ({} field changes), {} skipped",
+                if dry_run { "DRY RUN — nothing saved. " } else { "" },
+                r.rows, r.matched, r.created, r.updated_assets, r.fields_changed, r.skipped
+            );
+            if !r.ignored_columns.is_empty() {
+                println!("Ignored columns: {}", r.ignored_columns.join(", "));
+            }
+            for x in r.results.iter().filter(|x| x.action != "unchanged" || !x.errors.is_empty()) {
+                println!(
+                    "  row {:>4}  {:<9} {:<24} {}{}",
+                    x.row, x.action, trunc(x.asset.as_deref().unwrap_or("-"), 24), x.changes.join("; "),
+                    if x.errors.is_empty() { String::new() } else { format!("  !! {}", x.errors.join("; ")) }
+                );
+            }
+        }
+        Cmd::Field { action } => match action {
+            FieldCmd::Add { name } => {
+                let id = db.add_custom_field(&name)?;
+                println!("Custom field #{id} '{}' added", name.trim());
+            }
+            FieldCmd::List => {
+                for f in db.custom_fields()? {
+                    println!("#{:<4} {:<40} {} asset(s)", f.id, f.name, f.in_use);
+                }
+            }
+            FieldCmd::Remove { name } => {
+                let f = db.custom_fields()?.into_iter().find(|f| f.name.eq_ignore_ascii_case(&name) || f.id.to_string() == name)
+                    .with_context(|| format!("no custom field '{name}'"))?;
+                db.delete_custom_field(f.id)?;
+                println!("Removed custom field '{}' ({} value(s) deleted)", f.name, f.in_use);
+            }
+        },
         Cmd::Show { asset } => {
             let a = match asset.parse::<i64>() {
                 Ok(id) => db.get_asset(id)?,
@@ -472,4 +577,22 @@ fn print_assets(assets: &[db::Asset]) {
         );
     }
     println!("\n{} asset(s)", assets.len());
+}
+
+/// Find one asset by id, IP, MAC or exact name.
+fn find_asset(db: &Db, key: &str) -> Result<db::Asset> {
+    if let Ok(id) = key.parse::<i64>() {
+        return db.get_asset(id)?.with_context(|| format!("no asset #{id}"));
+    }
+    let all = db.list_assets(&AssetFilter::default())?;
+    let mac = scanner::arp::normalize_mac(key);
+    let hits: Vec<_> = all
+        .into_iter()
+        .filter(|a| a.ip == key || a.display_name().eq_ignore_ascii_case(key) || (mac.is_some() && a.mac == mac))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits.into_iter().next().unwrap()),
+        0 => bail!("no asset '{key}'"),
+        n => bail!("'{key}' matches {n} assets; use the asset id"),
+    }
 }

@@ -29,6 +29,11 @@ Medical (HL7 2575 / DICOM 104), Apple Device, Raspberry Pi, and virtual machines
 - **Change tracking**: discovered, IP/MAC/hostname/OS/type changes, ports opened/closed, online→offline
 - **Sites**: group assets by location (e.g. each clinic) using the subnets each site owns; scan,
   schedule, filter, export and query per site, and limit AI/API tokens to specific sites
+- **Asset details** the network can't tell you — name, asset tag, serial, manufacturer, model, owner,
+  department, cost center, location, purchase date, PO, supplier, warranty end — plus your own
+  **custom fields**; edit on the asset page, via CLI/API, or in bulk with **CSV import**
+- **Manual assets** for devices the scanner can't reach (off-site laptops, spare stock)
+- **Scan visibility**: where each record came from and how the scanner last detected it
 - **Scheduled scans** (hourly / daily / weekly …) that run while the server is up
 - **REST API** for scripting and integrations
 - Optional **HTTP basic auth**; listens on localhost only by default
@@ -50,6 +55,26 @@ are placed automatically: the site whose subnet most specifically contains the a
 individual device to a site from its asset page or with `rustsweeper site assign`; pinned devices
 stay put when subnets change. Each site has a **Scan now** button, and schedules can target a site
 so they always scan its current subnets. Existing databases are upgraded automatically.
+
+## Asset details, custom fields and CSV import
+
+Scanning finds what's on the wire; IT knows who owns it, where it lives and when its warranty
+ends. Each asset page has an **Asset details** form for that, and every edit is recorded in the
+asset's history. Define extra fields (e.g. *Room*, *Clinical use*) under **Custom fields**.
+
+For bulk updates, **Export CSV** from the Assets page, fill in columns in Excel, and **Import CSV**
+it back — the export is import-ready. Rows match existing assets by the first identifier present:
+`id`, `asset_tag`, `serial_number`, `mac`, `ip`, `name`. Empty cells leave a field alone, `-` clears
+it, read-only columns are ignored, and a **preview** (dry run) shows every change before saving.
+Tick *create missing* to add devices from a purchasing or MDM list.
+
+```sh
+rustsweeper field add "Room"
+rustsweeper set 10.10.0.25 owner="Jane Doe" department=Billing warranty_end=2027-06-30 custom:Room=12B
+rustsweeper add --name LAPTOP-0142 --mac AA-BB-CC-00-11-22
+rustsweeper import inventory.csv --dry-run
+rustsweeper import inventory.csv --create
+```
 
 ## Usage
 
@@ -119,8 +144,8 @@ rustsweeper --db C:\RustSweeper\rustsweeper.db mcp --allow-scans   # also expose
 | Tool | Purpose |
 |---|---|
 | `list_sites` | Start here: sites with subnets and asset counts, plus unassigned assets grouped by subnet |
-| `search_datasets` | Discover datasets (`assets`, `ports`, `changes`, `scans`), fields and operators |
-| `search_query_catalog` | 20 pre-built queries (remote access exposure, clear-text protocols, HL7/DICOM, new/offline/stale devices, counts by type/OS/vendor, port changes…); `run_id` executes one |
+| `search_datasets` | Discover datasets (`assets`, `ports`, `changes`, `custom_fields`, `scans`), fields and operators |
+| `search_query_catalog` | 26 pre-built queries (remote access exposure, clear-text protocols, HL7/DICOM, new/offline/stale devices, warranties expiring/expired, workstations without an owner, counts by type/OS/vendor/department, port changes…); `run_id` executes one |
 | `execute_query` | Structured query: dataset, optional `site`, fields, filters (`eq`, `contains`, `in`, `gte` …, relative times like `now-7d`), sort, `group_by`, limit 1–20 (default 10), offset |
 | `get_asset` | One device by id, IP or name: details, ports, recent changes |
 | `asset_history` | Change log for one device |
@@ -195,6 +220,9 @@ third-party AI assistant, check that it's allowed under your organization's AI-u
 | GET | `/api/scans/{id}` | Scan status + live progress |
 | GET | `/api/sites` | Sites with subnets and asset counts |
 | GET | `/api/datasets` | Queryable datasets, fields and operators |
+| POST | `/api/assets` | Add a manual asset: `{"name":"LAPTOP-0142","mac":"…"}` |
+| PATCH | `/api/assets/{id}` | Edit details: `{"owner":"Jane","warranty_end":"2027-06-30","custom":{"Room":"12B"},"site":"Dental"}` |
+| POST | `/api/import?dry_run=true&create_missing=true` | CSV body; returns a per-row report |
 | POST | `/api/query` | Structured query (same format as the MCP `execute_query` tool; up to 1000 rows) |
 
 CSV export: `GET /export.csv` (takes the same filters as the asset list).
@@ -235,6 +263,7 @@ src/
     http.rs            Streamable HTTP transport (/mcp), sessions, Origin checks
   auth.rs              API tokens for /mcp (optionally site-scoped)
   sites.rs             site subnets and longest-prefix assignment
+  import.rs            CSV import (matching, preview, custom fields)
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

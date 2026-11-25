@@ -110,6 +110,19 @@ CREATE TABLE IF NOT EXISTS sites (
     created_at   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS custom_fields (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS asset_custom_values (
+    asset_id  INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    field_id  INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+    value     TEXT NOT NULL,
+    PRIMARY KEY (asset_id, field_id)
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -153,16 +166,58 @@ pub struct Asset {
     pub site: Option<String>,
     /// True when IT pinned the asset to its site by hand (auto-assignment won't move it).
     pub site_manual: bool,
+    pub name_override: Option<String>,
+    pub asset_tag: Option<String>,
+    pub serial_number: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub owner: Option<String>,
+    pub department: Option<String>,
+    pub cost_center: Option<String>,
+    pub location: Option<String>,
+    pub purchase_date: Option<String>,
+    pub po_number: Option<String>,
+    pub supplier: Option<String>,
+    pub warranty_end: Option<String>,
+    /// Where the record came from: scanner, manual, import, api.
+    pub source: String,
+    /// How the scanner last established the device was up (tcp, ping, netbios, snmp, arp).
+    pub detected_by: Option<String>,
+    pub scan_count: i64,
 }
 
 impl Asset {
     /// Best human-friendly name for the asset.
     pub fn display_name(&self) -> String {
-        self.netbios_name
+        self.name_override
             .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.netbios_name.clone())
             .or_else(|| self.hostname.clone())
             .or_else(|| self.snmp_name.clone())
-            .unwrap_or_else(|| self.ip.clone())
+            .or_else(|| (!self.ip.is_empty()).then(|| self.ip.clone()))
+            .unwrap_or_else(|| format!("(unnamed #{})", self.id))
+    }
+
+    /// Value of an editable column by name.
+    pub fn editable(&self, column: &str) -> Option<String> {
+        match column {
+            "name_override" => self.name_override.clone(),
+            "asset_tag" => self.asset_tag.clone(),
+            "serial_number" => self.serial_number.clone(),
+            "manufacturer" => self.manufacturer.clone(),
+            "model" => self.model.clone(),
+            "owner" => self.owner.clone(),
+            "department" => self.department.clone(),
+            "cost_center" => self.cost_center.clone(),
+            "location" => self.location.clone(),
+            "purchase_date" => self.purchase_date.clone(),
+            "po_number" => self.po_number.clone(),
+            "supplier" => self.supplier.clone(),
+            "warranty_end" => self.warranty_end.clone(),
+            "notes" => Some(self.notes.clone()).filter(|n| !n.is_empty()),
+            _ => None,
+        }
     }
 }
 
@@ -292,7 +347,9 @@ const ASSET_COLS: &str = "a.id, a.ip, a.mac, a.vendor, a.hostname, a.netbios_nam
     a.os_guess, a.device_type, a.snmp_descr, a.snmp_name, a.snmp_location, a.snmp_contact, \
     a.http_title, a.http_server, a.ssh_banner, a.ttl, a.status, a.notes, a.first_seen, a.last_seen, \
     (SELECT COUNT(*) FROM ports p WHERE p.asset_id = a.id) AS open_ports, \
-    a.site_id, (SELECT st.name FROM sites st WHERE st.id = a.site_id), a.site_manual";
+    a.site_id, (SELECT st.name FROM sites st WHERE st.id = a.site_id), a.site_manual, \
+    a.name_override, a.asset_tag, a.serial_number, a.manufacturer, a.model, a.owner, a.department, a.cost_center, \
+    a.location, a.purchase_date, a.po_number, a.supplier, a.warranty_end, a.source, a.detected_by, a.scan_count";
 
 fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -321,6 +378,22 @@ fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
         site_id: r.get(22)?,
         site: r.get(23)?,
         site_manual: r.get::<_, i64>(24)? != 0,
+        name_override: r.get(25)?,
+        asset_tag: r.get(26)?,
+        serial_number: r.get(27)?,
+        manufacturer: r.get(28)?,
+        model: r.get(29)?,
+        owner: r.get(30)?,
+        department: r.get(31)?,
+        cost_center: r.get(32)?,
+        location: r.get(33)?,
+        purchase_date: r.get(34)?,
+        po_number: r.get(35)?,
+        supplier: r.get(36)?,
+        warranty_end: r.get(37)?,
+        source: r.get(38)?,
+        detected_by: r.get(39)?,
+        scan_count: r.get(40)?,
     })
 }
 
@@ -351,7 +424,82 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("scans", "site_id", "INTEGER"),
     ("schedules", "site_id", "INTEGER REFERENCES sites(id) ON DELETE CASCADE"),
     ("api_tokens", "sites", "TEXT"),
+    // Phase 2: editable asset details and scan visibility
+    ("assets", "name_override", "TEXT"),
+    ("assets", "asset_tag", "TEXT"),
+    ("assets", "serial_number", "TEXT"),
+    ("assets", "manufacturer", "TEXT"),
+    ("assets", "model", "TEXT"),
+    ("assets", "owner", "TEXT"),
+    ("assets", "department", "TEXT"),
+    ("assets", "cost_center", "TEXT"),
+    ("assets", "location", "TEXT"),
+    ("assets", "purchase_date", "TEXT"),
+    ("assets", "po_number", "TEXT"),
+    ("assets", "supplier", "TEXT"),
+    ("assets", "warranty_end", "TEXT"),
+    ("assets", "source", "TEXT NOT NULL DEFAULT 'scanner'"),
+    ("assets", "detected_by", "TEXT"),
+    ("assets", "scan_count", "INTEGER NOT NULL DEFAULT 0"),
 ];
+
+/// SQL expression for an asset's display name (alias `a`). Keep in sync with `Asset::display_name`.
+pub const NAME_SQL: &str =
+    "COALESCE(NULLIF(a.name_override,''), a.netbios_name, a.hostname, a.snmp_name, NULLIF(a.ip,''), '(unnamed #' || a.id || ')')";
+
+/// Fields IT can edit by hand / import: (column, label). Column names are whitelisted SQL identifiers.
+pub const EDITABLE_FIELDS: &[(&str, &str)] = &[
+    ("name_override", "Name"),
+    ("asset_tag", "Asset tag"),
+    ("serial_number", "Serial number"),
+    ("manufacturer", "Manufacturer"),
+    ("model", "Model"),
+    ("owner", "Owner"),
+    ("department", "Department"),
+    ("cost_center", "Cost center"),
+    ("location", "Location"),
+    ("purchase_date", "Purchase date"),
+    ("po_number", "PO number"),
+    ("supplier", "Supplier"),
+    ("warranty_end", "Warranty end"),
+    ("notes", "Notes"),
+];
+
+pub const DATE_FIELDS: &[&str] = &["purchase_date", "warranty_end"];
+
+/// Validate/normalise a value for an editable field. Empty → None (clear).
+pub fn normalize_field(column: &str, value: &str) -> Result<Option<String>> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if DATE_FIELDS.contains(&column) {
+        let d = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
+            .or_else(|_| chrono::NaiveDate::parse_from_str(v, "%m/%d/%Y"))
+            .or_else(|_| chrono::NaiveDate::parse_from_str(v, "%Y/%m/%d"))
+            .map_err(|_| anyhow::anyhow!("'{v}' is not a date (use YYYY-MM-DD)"))?;
+        return Ok(Some(d.format("%Y-%m-%d").to_string()));
+    }
+    if v.chars().count() > 500 {
+        anyhow::bail!("value too long (max 500 characters)");
+    }
+    Ok(Some(v.to_string()))
+}
+
+/// Custom field names: letters, digits, space, - and _, 1–40 chars, not clashing with built-in columns.
+pub fn validate_custom_field_name(name: &str) -> Result<String> {
+    let n = name.trim();
+    if n.is_empty() || n.chars().count() > 40 || !n.chars().all(|c| c.is_alphanumeric() || " -_".contains(c)) {
+        anyhow::bail!("custom field names must be 1–40 letters, digits, spaces, '-' or '_'");
+    }
+    let key = n.to_lowercase().replace(' ', "_");
+    const RESERVED: &[&str] = &["id", "ip", "name", "site", "mac", "vendor", "dns_name", "netbios_name", "domain", "device_type",
+        "os_guess", "open_ports", "status", "snmp_descr", "snmp_location", "first_seen", "last_seen", "source", "detected_by", "scan_count"];
+    if RESERVED.contains(&key.as_str()) || EDITABLE_FIELDS.iter().any(|(c, l)| *c == key || l.eq_ignore_ascii_case(n)) {
+        anyhow::bail!("'{n}' is already a built-in field");
+    }
+    Ok(n.to_string())
+}
 
 fn migrate(conn: &Connection) -> Result<()> {
     for (table, col, decl) in MIGRATIONS {
@@ -407,7 +555,10 @@ impl Db {
             sql.push_str(&format!(
                 " AND (a.ip LIKE ?{0} OR a.mac LIKE ?{0} OR a.hostname LIKE ?{0} OR a.netbios_name LIKE ?{0} \
                  OR a.vendor LIKE ?{0} OR a.os_guess LIKE ?{0} OR a.device_type LIKE ?{0} OR a.snmp_descr LIKE ?{0} \
-                 OR a.notes LIKE ?{0} OR a.http_title LIKE ?{0} \
+                 OR a.notes LIKE ?{0} OR a.http_title LIKE ?{0} OR a.name_override LIKE ?{0} OR a.asset_tag LIKE ?{0} \
+                 OR a.serial_number LIKE ?{0} OR a.owner LIKE ?{0} OR a.department LIKE ?{0} OR a.location LIKE ?{0} \
+                 OR a.model LIKE ?{0} OR a.manufacturer LIKE ?{0} \
+                 OR EXISTS (SELECT 1 FROM asset_custom_values cv WHERE cv.asset_id=a.id AND cv.value LIKE ?{0}) \
                  OR EXISTS (SELECT 1 FROM ports p WHERE p.asset_id=a.id AND (CAST(p.port AS TEXT)=?{1} OR p.service LIKE ?{0})))",
                 n + 1,
                 n + 2
@@ -437,7 +588,7 @@ impl Db {
         }
         // Whitelisted sort columns only (never interpolate user input directly).
         let order = match f.sort.as_deref() {
-            Some("name") => "COALESCE(a.netbios_name, a.hostname, a.ip) COLLATE NOCASE",
+            Some("name") => "COALESCE(NULLIF(a.name_override,''), a.netbios_name, a.hostname, a.ip) COLLATE NOCASE",
             Some("mac") => "a.mac",
             Some("vendor") => "a.vendor COLLATE NOCASE",
             Some("type") => "a.device_type",
@@ -478,11 +629,6 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn set_notes(&self, id: i64, notes: &str) -> Result<()> {
-        self.lock().execute("UPDATE assets SET notes=?1 WHERE id=?2", params![notes, id])?;
-        Ok(())
     }
 
     pub fn delete_asset(&self, id: i64) -> Result<()> {
@@ -631,6 +777,10 @@ impl Db {
         if let Some(ttl) = h.ttl {
             tx.execute("UPDATE assets SET ttl=?1 WHERE id=?2", params![ttl as i64, asset_id])?;
         }
+        tx.execute(
+            "UPDATE assets SET scan_count = scan_count + 1, detected_by = ?1 WHERE id = ?2",
+            params![h.detected_by.join(", "), asset_id],
+        )?;
 
         // Port diff.
         let old_ports: BTreeSet<u16> = {
@@ -693,7 +843,7 @@ impl Db {
 
     pub fn changes(&self, asset_id: Option<i64>, limit: i64) -> Result<Vec<Change>> {
         let conn = self.lock();
-        let sql = "SELECT c.id, c.asset_id, COALESCE(a.netbios_name, a.hostname, a.ip), c.scan_id, c.at, c.field, c.old_value, c.new_value \
+        let sql = "SELECT c.id, c.asset_id, COALESCE(NULLIF(a.name_override,''), a.netbios_name, a.hostname, NULLIF(a.ip,''), '#' || a.id), c.scan_id, c.at, c.field, c.old_value, c.new_value \
                    FROM changes c JOIN assets a ON a.id=c.asset_id \
                    WHERE (?1 IS NULL OR c.asset_id=?1) ORDER BY c.id DESC LIMIT ?2";
         let mut st = conn.prepare(sql)?;
@@ -1014,6 +1164,172 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomField {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub in_use: i64,
+}
+
+impl Db {
+    // ---------------------------------------------------------------- editable details
+
+    /// Apply edits to whitelisted columns. Each (column, value) with value None clears the field.
+    /// Changed values are recorded in the change log. Returns the number of fields changed.
+    pub fn update_asset_fields(&self, asset_id: i64, edits: &[(String, Option<String>)]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let ts = now();
+        let mut n = 0;
+        for (col, val) in edits {
+            let Some((col, _)) = EDITABLE_FIELDS.iter().find(|(c, _)| c == col) else {
+                anyhow::bail!("'{col}' is not an editable field");
+            };
+            let old: Option<String> = tx
+                .query_row(&format!("SELECT {col} FROM assets WHERE id=?1"), [asset_id], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("no asset {asset_id}"))?;
+            let old = old.filter(|s| !s.is_empty());
+            if old.as_deref() == val.as_deref() {
+                continue;
+            }
+            let stored = if *col == "notes" { Some(val.clone().unwrap_or_default()) } else { val.clone() };
+            tx.execute(&format!("UPDATE assets SET {col}=?1 WHERE id=?2"), params![stored, asset_id])?;
+            tx.execute(
+                "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,?3,?4,?5)",
+                params![asset_id, ts, col, old, val],
+            )?;
+            n += 1;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Create an asset that wasn't (or can't be) discovered by scanning.
+    pub fn create_manual_asset(&self, ip: Option<&str>, mac: Option<&str>, name: Option<&str>, source: &str) -> Result<i64> {
+        let ip = ip.map(str::trim).unwrap_or("").to_string();
+        if !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_err() {
+            anyhow::bail!("'{ip}' is not an IP address");
+        }
+        let mac = match mac.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => Some(crate::scanner::arp::normalize_mac(m).ok_or_else(|| anyhow::anyhow!("'{m}' is not a MAC address"))?),
+            None => None,
+        };
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        if ip.is_empty() && mac.is_none() && name.is_none() {
+            anyhow::bail!("give at least an IP, MAC or name");
+        }
+        let ip_num: i64 = match ip.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => u32::from(v4) as i64,
+            _ => 0,
+        };
+        let vendor = mac.as_deref().and_then(crate::scanner::oui::lookup);
+        let id = {
+            let conn = self.lock();
+            let ts = now();
+            conn.execute(
+                "INSERT INTO assets (ip, ip_num, mac, vendor, name_override, status, source, first_seen, last_seen) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', ?6, ?7, ?7)",
+                params![ip, ip_num, mac, vendor, name, source, ts],
+            )?;
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'discovered',NULL,?3)",
+                params![id, ts, format!("added ({source})")],
+            )?;
+            id
+        };
+        self.reassign_sites()?;
+        Ok(id)
+    }
+
+    // ---------------------------------------------------------------- custom fields
+
+    pub fn custom_fields(&self) -> Result<Vec<CustomField>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT f.id, f.name, f.created_at, (SELECT COUNT(*) FROM asset_custom_values v WHERE v.field_id = f.id) \
+             FROM custom_fields f ORDER BY f.name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([], |r| Ok(CustomField { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, in_use: r.get(3)? }))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_custom_field(&self, name: &str) -> Result<i64> {
+        let name = validate_custom_field_name(name)?;
+        let conn = self.lock();
+        conn.execute("INSERT INTO custom_fields (name, created_at) VALUES (?1, ?2)", params![name, now()])
+            .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("custom field '{name}' already exists") } else { e.into() })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_custom_field(&self, id: i64) -> Result<()> {
+        self.lock().execute("DELETE FROM custom_fields WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// (field name, value) pairs set on an asset.
+    pub fn asset_custom_values(&self, asset_id: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT f.name, v.value FROM asset_custom_values v JOIN custom_fields f ON f.id = v.field_id \
+             WHERE v.asset_id = ?1 ORDER BY f.name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([asset_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// All custom values keyed by asset id (for exports).
+    pub fn all_custom_values(&self) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, String>>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT v.asset_id, f.name, v.value FROM asset_custom_values v JOIN custom_fields f ON f.id = v.field_id",
+        )?;
+        let mut out: std::collections::HashMap<i64, std::collections::HashMap<String, String>> = Default::default();
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (id, k, v) = row?;
+            out.entry(id).or_default().insert(k, v);
+        }
+        Ok(out)
+    }
+
+    /// Set (Some) or clear (None) a custom value by field name; logs the change. Returns true if changed.
+    pub fn set_custom_value(&self, asset_id: i64, field: &str, value: Option<&str>) -> Result<bool> {
+        let conn = self.lock();
+        let (fid, fname): (i64, String) = conn
+            .query_row("SELECT id, name FROM custom_fields WHERE name = ?1 COLLATE NOCASE", [field.trim()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no custom field '{field}'"))?;
+        let old: Option<String> = conn
+            .query_row("SELECT value FROM asset_custom_values WHERE asset_id=?1 AND field_id=?2", params![asset_id, fid], |r| r.get(0))
+            .optional()?;
+        let value = value.map(str::trim).filter(|v| !v.is_empty());
+        if let Some(v) = value {
+            if v.chars().count() > 500 {
+                anyhow::bail!("value too long (max 500 characters)");
+            }
+        }
+        if old.as_deref() == value {
+            return Ok(false);
+        }
+        match value {
+            Some(v) => conn.execute(
+                "INSERT INTO asset_custom_values (asset_id, field_id, value) VALUES (?1,?2,?3) \
+                 ON CONFLICT(asset_id, field_id) DO UPDATE SET value = excluded.value",
+                params![asset_id, fid, v],
+            )?,
+            None => conn.execute("DELETE FROM asset_custom_values WHERE asset_id=?1 AND field_id=?2", params![asset_id, fid])?,
+        };
+        conn.execute(
+            "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,?3,?4,?5)",
+            params![asset_id, now(), format!("custom: {fname}"), old, value],
+        )?;
+        Ok(true)
     }
 }
 

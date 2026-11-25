@@ -187,7 +187,7 @@ impl McpServer {
             json!({
                 "name": "search_datasets",
                 "title": "Search datasets and fields",
-                "description": "Discover queryable datasets (assets, ports, changes, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
+                "description": "Discover queryable datasets (assets, ports, changes, custom_fields, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
                 "inputSchema": { "type": "object", "properties": { "keyword": { "type": "string" } } },
                 "annotations": ro,
             }),
@@ -457,6 +457,7 @@ fn get_asset(state: &AppState, args: &Value, scope: &Scope) -> Result<Value> {
     let a = asset.ok_or_else(|| anyhow!("asset not found"))?;
     Ok(json!({
         "asset": a,
+        "custom_fields": db.asset_custom_values(a.id)?.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
         "ports": db.asset_ports(a.id)?,
         "recent_changes": db.changes(Some(a.id), 20)?,
     }))
@@ -471,7 +472,10 @@ the MIB-II system group (sysName/sysDescr/sysLocation/sysContact), the local ARP
 hosts that block everything else), reverse DNS, and banners (SSH/FTP/SMTP/Telnet, HTTP Server header and <title>). \
 MAC prefixes map to vendors. A heuristic classifier assigns device_type and os_guess. Assets are matched across scans \
 by MAC first, then IP; changes are recorded in the 'changes' dataset. A device is marked offline when a scan covering \
-its IP gets no response. RustSweeper does not log in to devices, so it has no installed-software, user or patch data yet.";
+its IP gets no response. IT can add details the network can't reveal — owner, department, location, serial, model, purchase \
+and warranty dates, asset tag, custom fields — by hand, via CSV import or the API; those edits are logged in \
+'changes' too. Devices the scanner can't see can be added manually (source = manual/import/api). \
+RustSweeper does not log in to devices, so it has no installed-software, user or patch data yet.";
 
 fn docs(q: Option<&str>) -> Value {
     let mut sections: Vec<(String, String)> = vec![("How RustSweeper collects data".into(), DATA_MODEL_DOC.into())];
