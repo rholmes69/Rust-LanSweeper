@@ -86,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/import", post(api_import))
         .route("/assets/{id}/inventory", post(inventory_now))
         .route("/software", get(software_page))
+        .route("/posture/{check}", get(posture_page))
         .route("/credentials", get(credentials_page).post(add_credential))
         .route("/credentials/{id}/delete", post(delete_credential))
         .route("/assets/{id}/delete", post(delete_asset))
@@ -328,6 +329,21 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
         }
         html
     };
+    let posture = st.db.posture_counts()?;
+    let posture_html = if posture.first().is_none_or(|p| p.3 == 0) {
+        "<p class=muted>No Windows devices inventoried yet — add a credential on the <a href=/credentials>Credentials</a> page.</p>".to_string()
+    } else {
+        let rows: String = posture
+            .iter()
+            .map(|(key, label, n, total)| format!(
+                "<tr><td>{}</td><td style='text-align:right'>{}</td></tr>",
+                esc(label),
+                if *n > 0 { format!("<a href='/posture/{key}' style='color:var(--bad);font-weight:600'>{n}</a> <span class=muted>/ {total}</span>") }
+                else { format!("<span style='color:var(--ok)'>0</span> <span class=muted>/ {total}</span>") }
+            ))
+            .collect();
+        format!("<table>{rows}</table>")
+    };
     let scan_rows: String = scans
         .iter()
         .map(|sc| {
@@ -347,7 +363,7 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
          </div>\
          <div class=card><h2>Quick scan</h2>{}</div>\
          <div class='grid g2'><div class=card><h2>Assets by type</h2>{}</div><div class=card><h2>Assets by site</h2>{}</div></div>\
-         <div class='grid g2'><div class=card><h2>Top vendors</h2>{}</div><div></div></div>\
+         <div class='grid g2'><div class=card><h2>Top vendors</h2>{}</div><div class=card><h2>Windows security posture</h2>{}</div></div>\
          <div class='grid g2'>\
            <div class=card><h2>Recent scans</h2><table><tr><th>Scan</th><th>Targets</th><th>Status</th><th>Up</th><th>Started</th></tr>{}</table></div>\
            <div class=card><h2>Recent changes</h2>{}</div>\
@@ -357,6 +373,7 @@ async fn dashboard(State(st): State<AppState>) -> WebResult<Html<String>> {
         bars(&s.by_type, max_t, true),
         site_bars,
         bars(&s.by_vendor, max_v, false),
+        posture_html,
         if scan_rows.is_empty() { "<tr><td colspan=5 class=muted>No scans yet</td></tr>".into() } else { scan_rows },
         changes_table(&changes, true),
     );
@@ -1207,6 +1224,7 @@ fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
     format!(
         "<div class=card><h2>Windows inventory <span class=muted style='font-weight:400'>· {} via {}</span></h2>{status}\
          <div class='grid g2' style='gap:8px 24px'><dl>{}</dl><dl>{}</dl></div>\
+         {}\
          <h2 style='margin-top:14px'>Disks</h2><table><tr><th>Drive</th><th>FS</th><th>Size</th><th>Free</th></tr>{}</table>\
          <h2 style='margin-top:14px'>Network adapters</h2><table><tr><th>Adapter</th><th>MAC</th><th>IPs</th></tr>{}</table></div>",
         t("collected_at"), t("credential"),
@@ -1229,6 +1247,7 @@ fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
                 n("logical_processors").map(|c| c.to_string()).unwrap_or_else(|| "?".into()))),
             row("Memory", n("memory_mb").map(|m| format!("{:.1} GB", m as f64 / 1024.0)).unwrap_or_else(|| "—".into())),
         ].concat(),
+        security_html(&w),
         if disks.is_empty() { "<tr><td colspan=4 class=muted>None reported</td></tr>".into() } else { disks },
         if nics.is_empty() { "<tr><td colspan=3 class=muted>None reported</td></tr>".into() } else { nics },
     )
@@ -1312,6 +1331,59 @@ async fn software_page(State(st): State<AppState>, Query(q): Query<SoftwareQuery
         esc(q.q.as_deref().unwrap_or("")),
         if rows.is_empty() { "<tr><td colspan=4 class=muted>No software inventoried yet — it's collected by Windows inventory (see Credentials).</td></tr>".into() } else { rows }
     )))
+}
+
+async fn posture_page(State(st): State<AppState>, Path(check): Path<String>) -> WebResult<Response> {
+    let Some((label, assets)) = st.db.posture_assets(&check)? else { return Ok(not_found()) };
+    Ok(page(label, "dashboard", format!(
+        "<div class=row><h1>{} <span class=muted style='font-weight:400'>({})</span></h1><div class=spacer></div><a href=/>Dashboard</a></div>\
+         <div class=card style='padding:0;overflow-x:auto'>{}</div>",
+        esc(label), assets.len(), assets_table(&assets, None)
+    )).into_response())
+}
+
+fn security_html(w: &serde_json::Value) -> String {
+    let flag = |k: &str, good_when: i64| -> String {
+        match w.get(k).and_then(|v| v.as_i64()) {
+            Some(v) if v == good_when => "<span class='pill ok'>OK</span>".into(),
+            Some(_) => "<span class='pill bad'>Attention</span>".into(),
+            None => "<span class=muted>unknown</span>".into(),
+        }
+    };
+    let t = |k: &str| w.get(k).and_then(|v| v.as_str()).map(esc).unwrap_or_else(|| "<span class=muted>—</span>".into());
+    if w.get("av_ok").is_none_or(|v| v.is_null()) && w.get("last_patch_date").is_none_or(|v| v.is_null()) && w.get("bitlocker_os").is_none_or(|v| v.is_null()) {
+        return String::new();
+    }
+    let av_names: String = w
+        .get("av_products")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+        .map(|list| list.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(esc)).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    let row = |k: &str, v: String| format!("<dt>{k}</dt><dd>{v}</dd>");
+    let reboot = match w.get("reboot_pending").and_then(|v| v.as_i64()) {
+        Some(1) => "<span class='pill run'>Restart pending</span>".to_string(),
+        Some(_) => "<span class='pill ok'>No</span>".into(),
+        None => "<span class=muted>unknown</span>".into(),
+    };
+    let errors = w.get("protection_errors").and_then(|v| v.as_str()).filter(|e| !e.is_empty())
+        .map(|e| format!("<p class=hint>Some checks unavailable: {}</p>", esc(e))).unwrap_or_default();
+    format!(
+        "<h2 style='margin-top:14px'>Security</h2><div class='grid g2' style='gap:8px 24px'><dl>{}</dl><dl>{}</dl></div>{errors}",
+        [
+            row("Antivirus", format!("{} {}", flag("av_ok", 1), av_names)),
+            row("Defender signatures", t("defender_sig_updated")),
+            row("BitLocker (C:)", flag("bitlocker_os", 1)),
+            row("Firewall", flag("firewall_off", 0)),
+        ].concat(),
+        [
+            row("Last update installed", t("last_patch_date")),
+            row("Updates listed", w.get("hotfix_count").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_else(|| "—".into())),
+            row("Release / build", format!("{} / {}.{}", t("display_version"), t("os_build"),
+                w.get("ubr").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_else(|| "?".into()))),
+            row("Restart pending", reboot),
+        ].concat(),
+    )
 }
 
 async fn inventory_now(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {

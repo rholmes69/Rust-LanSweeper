@@ -57,8 +57,12 @@ fn encoded_command_is_utf16le_base64() {
     let raw = base64::engine::general_purpose::STANDARD.decode(enc).unwrap();
     let units: Vec<u16> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     assert_eq!(String::from_utf16(&units).unwrap(), "Get-Date");
-    // The collector script must fit comfortably within Windows' command-line limit (32,767 chars).
-    assert!(encode_command(COLLECT_PS).len() < 24_000);
+    // The whole command line must fit within Windows' 32,767-character limit, with headroom.
+    let cmdline = 80 + encode_command(COLLECT_PS).len();
+    assert!(cmdline < 28_000, "collector command line is {cmdline} chars");
+    // Minifying keeps code lines intact (only comments/indentation go).
+    let m = minify(COLLECT_PS);
+    assert!(m.contains("function Get-Protection($session) {") && !m.contains("\n#"));
 }
 
 #[test]
@@ -304,4 +308,76 @@ fn parses_nested_software_list() {
     assert_eq!(inv.software.len(), 2);
     assert_eq!(normalize_product(&inv.software[1].name), "Audacity");
     assert!(!COLLECT_PS.contains(", $list.ToArray()"), "collector must not comma-wrap the software list");
+}
+
+const WITH_PROTECTION: &str = r#"{"ok":true,"computer_name":"FRONTDESK-01","os_name":"Microsoft Windows 11 Pro","os_build":"26100",
+"protection":{
+  "antivirus":[{"name":"Windows Defender","product_state":397568},{"name":"Old AV","product_state":393472}],
+  "defender":{"antivirus_enabled":true,"realtime_enabled":true,"signature_updated":"2026-11-25 03:12:00","signature_version":"1.421.1"},
+  "bitlocker":[{"drive":"C:","protection_status":0},{"drive":"D:","protection_status":1}],
+  "hotfixes":[{"id":"KB5044284","description":"Security Update","installed_on":"11/12/2025"},
+              {"id":"KB5043080","description":"Update","installed_on":"2025-10-08"},
+              {"id":"KB0000000","description":"Update","installed_on":null}],
+  "reboot_pending":true,
+  "firewall":{"domain":1,"private":1,"public":0},
+  "display_version":"24H2","ubr":2314,
+  "errors":["defender: x"]}}"#;
+
+#[test]
+fn decodes_protection() {
+    let inv = parse_output(WITH_PROTECTION).unwrap();
+    let p = inv.protection.as_ref().unwrap();
+    let av = p.antivirus.as_ref().unwrap();
+    // 397568 = 0x061100: enabled, up to date. 393472 = 0x060100: disabled.
+    assert_eq!((av[0].enabled(), av[0].up_to_date()), (Some(true), Some(true)));
+    assert_eq!(av[1].enabled(), Some(false));
+    assert_eq!(p.av_ok(), Some(true));
+    assert_eq!(p.bitlocker_os(), Some(false));
+    assert_eq!(p.firewall_off(), Some(true));
+    assert_eq!(p.last_patch_date().as_deref(), Some("2025-11-12"));
+    // Outdated definitions and Defender off → not protected; nothing readable → unknown.
+    let stale = Protection { antivirus: Some(vec![AvProduct { name: None, product_state: Some(0x061110) }]), ..Default::default() };
+    assert_eq!(stale.av_ok(), Some(false));
+    assert_eq!(Protection::default().av_ok(), None);
+    // Windows Server: no Security Center, Defender on.
+    let server = Protection { defender: Some(Defender { antivirus_enabled: true, realtime_enabled: true, ..Default::default() }), ..Default::default() };
+    assert_eq!(server.av_ok(), Some(true));
+    // A null section stays "unknown" rather than "empty".
+    let p2: Protection = serde_json::from_str(r#"{"antivirus":null,"bitlocker":{"value":[{"drive":"C:","protection_status":1}],"Count":1}}"#).unwrap();
+    assert!(p2.antivirus.is_none());
+    assert_eq!(p2.bitlocker_os(), Some(true));
+}
+
+#[tokio::test]
+async fn protection_is_stored_queried_and_tracked() {
+    let (db, id) = seeded();
+    let inv = parse_output(WITH_PROTECTION).unwrap();
+    db.save_windows_inventory(id, &inv, None, "svc").unwrap();
+    let w = db.windows_inventory(id).unwrap().unwrap();
+    assert_eq!(w["av_ok"], 1);
+    assert_eq!(w["bitlocker_os"], 0);
+    assert_eq!(w["hotfix_count"], 3);
+    assert_eq!(w["ubr"], 2314);
+
+    let counts = db.posture_counts().unwrap();
+    let get = |k: &str| counts.iter().find(|c| c.0 == k).unwrap().2;
+    assert_eq!((get("no-av"), get("bitlocker-off"), get("not-patched"), get("reboot-pending"), get("firewall-off")), (0, 1, 1, 1, 1));
+    assert_eq!(db.posture_assets("bitlocker-off").unwrap().unwrap().1.len(), 1);
+
+    let mcp = crate::mcp::McpServer::new(crate::web::AppState::new(db.clone(), crate::scanner::ScanOptions::default(), None), false);
+    let scope = crate::query::Scope::all();
+    for (tpl, expect) in [("bitlocker-off", 1), ("no-antivirus", 0), ("not-patched-45d", 1), ("reboot-pending", 1), ("firewall-disabled", 1)] {
+        let r = mcp.call_tool("search_query_catalog", &serde_json::json!({"run_id": tpl}), &scope).await.unwrap();
+        assert_eq!(r["result"]["total"], expect, "{tpl}: {r}");
+    }
+    let r = mcp.call_tool("execute_query", &serde_json::json!({"dataset":"hotfixes","filters":[{"field":"hotfix_id","op":"eq","value":"KB5044284"}]}), &scope).await.unwrap();
+    assert_eq!(r["total"], 1);
+    let r = mcp.call_tool("execute_query", &serde_json::json!({"dataset":"assets","fields":["full_build","display_version"]}), &scope).await.unwrap();
+    assert_eq!(r["rows"][0]["full_build"], "26100.2314");
+
+    // Turning BitLocker on is logged.
+    let mut fixed = inv.clone();
+    fixed.protection.as_mut().unwrap().bitlocker = Some(vec![BitLockerVolume { drive: Some("C:".into()), protection_status: Some(1) }]);
+    db.save_windows_inventory(id, &fixed, None, "svc").unwrap();
+    assert!(db.changes(Some(id), 50).unwrap().iter().any(|c| c.field == "windows: bitlocker" && c.new_value.as_deref() == Some("on")));
 }

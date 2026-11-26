@@ -55,6 +55,67 @@ function Get-Software($session) {
     $list.ToArray()
 }
 
+# Security posture: antivirus, Defender, BitLocker, firewall, patches, pending reboot.
+# Each part is independent; failures are reported in 'errors' without losing the rest.
+function Get-Protection($session) {
+    $errs = New-Object System.Collections.Generic.List[string]
+    $r = [ordered]@{}
+
+    try {
+        $r.antivirus = @(Get-CimInstance -CimSession $session -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ name = $_.displayName; product_state = [int64]$_.productState }
+        })
+    } catch { $r.antivirus = $null; $errs.Add("antivirus: $($_.Exception.Message)") }   # not present on Windows Server
+
+    try {
+        $mp = Get-CimInstance -CimSession $session -Namespace root/Microsoft/Windows/Defender -ClassName MSFT_MpComputerStatus -ErrorAction Stop
+        $r.defender = [pscustomobject]@{
+            antivirus_enabled  = [bool]$mp.AntivirusEnabled
+            realtime_enabled   = [bool]$mp.RealTimeProtectionEnabled
+            signature_updated  = (Fmt $mp.AntivirusSignatureLastUpdated)
+            signature_version  = $mp.AntivirusSignatureVersion
+        }
+    } catch { $r.defender = $null; $errs.Add("defender: $($_.Exception.Message)") }
+
+    try {
+        $r.bitlocker = @(Get-CimInstance -CimSession $session -Namespace root/cimv2/Security/MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ drive = $_.DriveLetter; protection_status = [int]$_.ProtectionStatus }
+        })
+    } catch { $r.bitlocker = $null; $errs.Add("bitlocker: $($_.Exception.Message)") }   # absent on Home editions
+
+    try {
+        $r.hotfixes = @(Get-CimInstance -CimSession $session -ClassName Win32_QuickFixEngineering -ErrorAction Stop | ForEach-Object {
+            $d = $_.InstalledOn
+            if ($d -is [datetime]) { $d = $d.ToString('yyyy-MM-dd') } elseif ($d) { $d = "$d" } else { $d = $null }
+            [pscustomobject]@{ id = $_.HotFixID; description = $_.Description; installed_on = $d }
+        })
+    } catch { $r.hotfixes = $null; $errs.Add("hotfixes: $($_.Exception.Message)") }
+
+    try {
+        $cbs = Reg $session 'EnumKey' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' $null
+        $wu  = Reg $session 'EnumKey' 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' $null
+        $r.reboot_pending = ($cbs.ReturnValue -eq 0) -or ($wu.ReturnValue -eq 0)
+    } catch { $r.reboot_pending = $null; $errs.Add("reboot: $($_.Exception.Message)") }
+
+    try {
+        $fw = 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\'
+        $r.firewall = [pscustomobject]@{
+            domain  = (Reg $session 'GetDWORDValue' ($fw + 'DomainProfile') 'EnableFirewall').uValue
+            private = (Reg $session 'GetDWORDValue' ($fw + 'StandardProfile') 'EnableFirewall').uValue
+            public  = (Reg $session 'GetDWORDValue' ($fw + 'PublicProfile') 'EnableFirewall').uValue
+        }
+    } catch { $r.firewall = $null; $errs.Add("firewall: $($_.Exception.Message)") }
+
+    try {
+        $nt = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        $r.display_version = (Reg $session 'GetStringValue' $nt 'DisplayVersion').sValue
+        $r.ubr = (Reg $session 'GetDWORDValue' $nt 'UBR').uValue
+    } catch { $errs.Add("version: $($_.Exception.Message)") }
+
+    $r.errors = $errs.ToArray()
+    [pscustomobject]$r
+}
+
 function Unprotect($blob) {
     Add-Type -AssemblyName System.Security
     $bytes = [Convert]::FromBase64String($blob)
@@ -103,6 +164,9 @@ try {
         })
     } catch { $servicesError = $_.Exception.Message }
 
+    $protection = $null
+    try { $protection = Get-Protection $s } catch { $protection = [pscustomobject]@{ errors = @("protection: $($_.Exception.Message)") } }
+
     $cores = 0
     foreach ($c in $cpus) { if ($c.NumberOfCores) { $cores += [int]$c.NumberOfCores } }
     $cpuName = $null
@@ -137,6 +201,7 @@ try {
         software_error     = $softwareError
         services           = $services
         services_error     = $servicesError
+        protection         = $protection
     })
 } catch {
     Fail 'query' $_.Exception.Message
