@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icons/rustlandsweeper-256.png" width="160" alt="RustLandSweeper logo"></p>
+
 # RustSweeper
 
 An agentless, Lansweeper-style network asset inventory written in Rust. One self-contained
@@ -299,6 +301,22 @@ third-party AI assistant, check that it's allowed under your organization's AI-u
 | POST | `/api/query` | Structured query (same format as the MCP `execute_query` tool; up to 1000 rows) |
 
 CSV export: `GET /export.csv` (takes the same filters as the asset list).
+
+## Desktop shortcut
+
+On Windows the build embeds the RustLandSweeper icon in `rustsweeper.exe` (via `build.rs`). To add a
+desktop shortcut that opens the dashboard's server:
+
+```powershell
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:USERPROFILE\Desktop\RustLandSweeper.lnk")
+$s.TargetPath = "C:\RustSweeper\rustsweeper.exe"
+$s.Arguments = "serve --db C:\RustSweeper\rustsweeper.db"
+$s.IconLocation = "C:\RustSweeper\rustsweeper.exe,0"
+$s.Save()
+```
+
+Logo artwork is in `assets/icons` (`rustlandsweeper.ico` has 16–256 px sizes; PNGs at 256 and
+1024 px). The web dashboard uses it as its favicon and header logo.
 
 ## Running as a Windows service
 
