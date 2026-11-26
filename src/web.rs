@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/custom-fields/{id}/delete", post(delete_custom_field))
         .route("/api/import", post(api_import))
         .route("/assets/{id}/inventory", post(inventory_now))
+        .route("/software", get(software_page))
         .route("/credentials", get(credentials_page).post(add_credential))
         .route("/credentials/{id}/delete", post(delete_credential))
         .route("/assets/{id}/delete", post(delete_asset))
@@ -233,7 +234,7 @@ fn page(title: &str, active: &str, body: String) -> Html<String> {
 }
 
 fn page_ext(title: &str, active: &str, body: String, head_extra: &str) -> Html<String> {
-    let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("sites", "/sites", "Sites"), ("scans", "/scans", "Scans"),
+    let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("sites", "/sites", "Sites"), ("software", "/software", "Software"), ("scans", "/scans", "Scans"),
         ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes"), ("credentials", "/credentials", "Credentials"), ("ai", "/ai-access", "AI access")]
         .iter()
         .map(|(k, href, label)| {
@@ -513,7 +514,7 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
          <div class='grid g3'>\
           <div>\
            <div class=card><h2>Identity</h2><dl>{identity}</dl></div>\
-           {windows_card}\
+           {windows_card}{software_card}\
            <div class=card><h2>Open ports ({nports})</h2><table><tr><th>Port</th><th>Service</th><th>Banner</th></tr>{port_rows}</table></div>\
            <div class=card><h2>History</h2>{history}</div>\
           </div>\
@@ -562,6 +563,7 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
         .concat(),
         web = [row("Server", opt(&a.http_server)), row("Title", opt(&a.http_title))].concat(),
         windows_card = windows_card(&a, st.db.windows_inventory(a.id)?),
+        software_card = software_services_card(&st.db.asset_software(a.id)?, &st.db.asset_services(a.id)?),
         details_form = details_form(&a, &st.db.custom_fields()?, &st.db.asset_custom_values(a.id)?),
         site_opts = std::iter::once(format!("<option value=''{}>Automatic (by subnet)</option>", if a.site_manual { "" } else { " selected" }))
             .chain(st.db.list_sites()?.iter().map(|x| format!(
@@ -1230,6 +1232,86 @@ fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
         if disks.is_empty() { "<tr><td colspan=4 class=muted>None reported</td></tr>".into() } else { disks },
         if nics.is_empty() { "<tr><td colspan=3 class=muted>None reported</td></tr>".into() } else { nics },
     )
+}
+
+fn software_services_card(software: &[serde_json::Value], services: &[serde_json::Value]) -> String {
+    if software.is_empty() && services.is_empty() {
+        return String::new();
+    }
+    let t = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(esc).unwrap_or_default();
+    let sw_rows: String = software
+        .iter()
+        .map(|x| format!("<tr><td>{}</td><td class=mono>{}</td><td>{}</td><td class=muted>{}</td><td class=muted>{}</td></tr>",
+            t(x, "name"), t(x, "version"), t(x, "publisher"), t(x, "install_date"), t(x, "arch")))
+        .collect();
+    let stopped = services.iter().filter(|x| x["start_mode"] == "Auto" && x["state"] != "Running").count();
+    let flagged = services.iter().filter(|x| x["unquoted_path"] == true || x["custom_account"] == true).count();
+    let sv_rows: String = services
+        .iter()
+        .map(|x| {
+            let warn = x["start_mode"] == "Auto" && x["state"] != "Running";
+            let mut flags = Vec::new();
+            if x["unquoted_path"] == true { flags.push("<span class='pill bad'>unquoted path</span>"); }
+            if x["custom_account"] == true { flags.push("<span class='pill run'>user account</span>"); }
+            format!("<tr><td>{}<br><span class='muted mono'>{}</span></td><td{}>{}</td><td>{}</td><td class=mono>{}</td><td>{}</td></tr>",
+                t(x, "display_name"), t(x, "name"),
+                if warn { " style='color:var(--bad);font-weight:600'" } else { "" },
+                t(x, "state"), t(x, "start_mode"), t(x, "start_name"), flags.join(" "))
+        })
+        .collect();
+    format!(
+        "<div class=card><details><summary style='cursor:pointer'><b>Installed software ({})</b></summary>\
+           <table style='margin-top:8px'><tr><th>Name</th><th>Version</th><th>Publisher</th><th>Installed</th><th>Arch</th></tr>{}</table></details></div>\
+         <div class=card><details{}><summary style='cursor:pointer'><b>Services ({})</b>{}</summary>\
+           <table style='margin-top:8px'><tr><th>Service</th><th>State</th><th>Start</th><th>Log on as</th><th></th></tr>{}</table></details></div>",
+        software.len(),
+        if sw_rows.is_empty() { "<tr><td colspan=5 class=muted>None reported</td></tr>".into() } else { sw_rows },
+        if stopped > 0 { " open" } else { "" },
+        services.len(),
+        match (stopped, flagged) {
+            (0, 0) => String::new(),
+            _ => format!(" <span class=muted>· {stopped} automatic not running · {flagged} flagged</span>"),
+        },
+        sv_rows
+    )
+}
+
+#[derive(Deserialize, Default)]
+struct SoftwareQuery {
+    q: Option<String>,
+    product: Option<String>,
+}
+
+async fn software_page(State(st): State<AppState>, Query(q): Query<SoftwareQuery>) -> WebResult<Html<String>> {
+    if let Some(product) = q.product.as_deref().filter(|p| !p.is_empty()) {
+        let rows: String = st
+            .db
+            .software_installs(product)?
+            .iter()
+            .map(|(id, name, ip, site, ver)| format!(
+                "<tr><td><a href='/assets/{id}'>{}</a></td><td class=mono>{}</td><td>{}</td><td class=mono>{}</td></tr>",
+                esc(name), esc(ip), opt(site), opt(ver)))
+            .collect();
+        return Ok(page(product, "software", format!(
+            "<div class=row><h1>{}</h1><div class=spacer></div><a href=/software>All software</a></div>\
+             <div class=card style='padding:0'><table><tr><th>Device</th><th>IP</th><th>Site</th><th>Version</th></tr>{}</table></div>",
+            esc(product), if rows.is_empty() { "<tr><td colspan=4 class=muted>Not installed anywhere</td></tr>".into() } else { rows }
+        )));
+    }
+    let list = st.db.software_summary(q.q.as_deref(), 500)?;
+    let rows: String = list
+        .iter()
+        .map(|(p, publ, installs, versions)| format!(
+            "<tr><td><a href='/software?product={}'>{}</a></td><td>{}</td><td>{installs}</td><td>{}</td></tr>",
+            url_enc(p), esc(p), opt(publ), if *versions > 1 { format!("<b>{versions}</b>") } else { versions.to_string() }))
+        .collect();
+    Ok(page("Software", "software", format!(
+        "<h1>Software</h1><div class=card><form class=row action=/software><input type=text name=q value='{}' placeholder='Search product or publisher…' style='flex:1'><button>Search</button></form>\
+         <div class=hint>Collected by Windows inventory from each device's registry. Product names are normalised (versions and architecture tags removed) so installs group together; several versions of one product usually means some devices are behind on updates.</div></div>\
+         <div class=card style='padding:0;overflow-x:auto'><table><tr><th>Product</th><th>Publisher</th><th>Devices</th><th>Versions</th></tr>{}</table></div>",
+        esc(q.q.as_deref().unwrap_or("")),
+        if rows.is_empty() { "<tr><td colspan=4 class=muted>No software inventoried yet — it's collected by Windows inventory (see Credentials).</td></tr>".into() } else { rows }
+    )))
 }
 
 async fn inventory_now(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {

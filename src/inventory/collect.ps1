@@ -13,6 +13,43 @@ function Out-Result($obj) { $obj | ConvertTo-Json -Depth 5 -Compress; exit 0 }
 function Fail($stage, $err) { Out-Result ([pscustomobject]@{ ok = $false; stage = $stage; error = "$err" }) }
 function Fmt($d) { if ($d -is [datetime]) { $d.ToString('yyyy-MM-dd HH:mm:ss') } else { $null } }
 
+# Registry access through WMI's StdRegProv (no remote-registry service or file shares needed).
+$HKLM = [uint32]2147483650
+function Reg($session, $method, $path, $value) {
+    $a = @{ hDefKey = $HKLM; sSubKeyName = $path }
+    if ($value) { $a.sValueName = $value }
+    Invoke-CimMethod -CimSession $session -Namespace root/default -ClassName StdRegProv -MethodName $method -Arguments $a -ErrorAction Stop
+}
+
+# Installed programs from the Uninstall keys (64- and 32-bit views). Win32_Product is deliberately
+# NOT used: querying it makes Windows Installer re-validate every MSI package.
+function Get-Software($session) {
+    $list = New-Object System.Collections.Generic.List[object]
+    $roots = @(
+        @{ path = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'; arch = 'x64' },
+        @{ path = 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; arch = 'x86' }
+    )
+    foreach ($root in $roots) {
+        $keys = Reg $session 'EnumKey' $root.path $null
+        if ($keys.ReturnValue -ne 0 -or -not $keys.sNames) { continue }
+        foreach ($k in $keys.sNames) {
+            $p = $root.path + '\' + $k
+            $name = (Reg $session 'GetStringValue' $p 'DisplayName').sValue
+            if (-not $name) { continue }
+            if ((Reg $session 'GetDWORDValue' $p 'SystemComponent').uValue -eq 1) { continue }
+            if ((Reg $session 'GetStringValue' $p 'ParentKeyName').sValue) { continue }   # updates/patches of another product
+            $list.Add([pscustomobject]@{
+                name         = $name.Trim()
+                version      = (Reg $session 'GetStringValue' $p 'DisplayVersion').sValue
+                publisher    = (Reg $session 'GetStringValue' $p 'Publisher').sValue
+                install_date = (Reg $session 'GetStringValue' $p 'InstallDate').sValue
+                arch         = $root.arch
+            })
+        }
+    }
+    , $list.ToArray()
+}
+
 function Unprotect($blob) {
     Add-Type -AssemblyName System.Security
     $bytes = [Convert]::FromBase64String($blob)
@@ -52,6 +89,15 @@ try {
         [pscustomobject]@{ description = $_.Description; mac = $_.MACAddress; ips = @($_.IPAddress) }
     })
 
+    $software = @(); $softwareError = $null
+    try { $software = @(Get-Software $s) } catch { $softwareError = $_.Exception.Message }
+    $services = @(); $servicesError = $null
+    try {
+        $services = @(Get-CimInstance @q -ClassName Win32_Service | ForEach-Object {
+            [pscustomobject]@{ name = $_.Name; display_name = $_.DisplayName; state = $_.State; start_mode = $_.StartMode; start_name = $_.StartName; path = $_.PathName }
+        })
+    } catch { $servicesError = $_.Exception.Message }
+
     $cores = 0
     foreach ($c in $cpus) { if ($c.NumberOfCores) { $cores += [int]$c.NumberOfCores } }
     $cpuName = $null
@@ -82,6 +128,10 @@ try {
         cores              = $cores
         disks              = $disks
         nics               = $nics
+        software           = $software
+        software_error     = $softwareError
+        services           = $services
+        services_error     = $servicesError
     })
 } catch {
     Fail 'query' $_.Exception.Message

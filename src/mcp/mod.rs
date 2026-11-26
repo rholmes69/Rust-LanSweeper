@@ -187,7 +187,7 @@ impl McpServer {
             json!({
                 "name": "search_datasets",
                 "title": "Search datasets and fields",
-                "description": "Discover queryable datasets (assets, ports, changes, custom_fields, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
+                "description": "Discover queryable datasets (assets, ports, changes, custom_fields, software, services, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
                 "inputSchema": { "type": "object", "properties": { "keyword": { "type": "string" } } },
                 "annotations": ro,
             }),
@@ -459,6 +459,12 @@ fn get_asset(state: &AppState, args: &Value, scope: &Scope) -> Result<Value> {
         "asset": a,
         "custom_fields": db.asset_custom_values(a.id)?.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
         "windows_inventory": db.windows_inventory(a.id)?,
+        "software": {
+            "count": db.asset_software(a.id)?.len(),
+            "hint": "Query the 'software' dataset with a filter on asset_id for the full list.",
+        },
+        "services_not_running_but_automatic": db.asset_services(a.id)?.into_iter()
+            .filter(|s| s["start_mode"] == "Auto" && s["state"] != "Running").take(20).collect::<Vec<_>>(),
         "ports": db.asset_ports(a.id)?,
         "recent_changes": db.changes(Some(a.id), 20)?,
     }))
@@ -478,8 +484,9 @@ and warranty dates, asset tag, custom fields — by hand, via CSV import or the 
 'changes' too. Devices the scanner can't see can be added manually (source = manual/import/api). \
 When RustSweeper runs on Windows with credentials, it also logs in to Windows devices over WMI and records \
 hardware (manufacturer, model, serial, BIOS, CPU, RAM, disks), OS edition/build, install date, last boot and the \
-logged-on user (fields os, os_build, last_user, memory_mb, min_disk_free_pct, last_boot, inventory_status…). \
-Installed software, services and patches are not collected yet.";
+logged-on user (fields os, os_build, last_user, memory_mb, min_disk_free_pct, last_boot, inventory_status…), \
+plus installed programs ('software' dataset, from the registry Uninstall keys) and Windows services ('services' \
+dataset, with unquoted-path and custom-account flags). Patches/hotfixes are not collected yet.";
 
 fn docs(q: Option<&str>) -> Value {
     let mut sections: Vec<(String, String)> = vec![("How RustSweeper collects data".into(), DATA_MODEL_DOC.into())];

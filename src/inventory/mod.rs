@@ -26,7 +26,8 @@ $enc = [Security.Cryptography.ProtectedData]::Protect($bytes, $entropy, [Securit
 "#;
 
 /// How long one collection may take before it is abandoned.
-pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Software enumeration over StdRegProv makes many small WMI calls, so allow a few minutes.
+pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Disk {
@@ -42,6 +43,109 @@ pub struct Nic {
     pub mac: Option<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Software {
+    pub name: String,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    /// Usually YYYYMMDD as written by the installer.
+    pub install_date: Option<String>,
+    pub arch: Option<String>,
+}
+
+impl Software {
+    /// Install date as YYYY-MM-DD when the installer wrote a recognisable date.
+    pub fn install_date_iso(&self) -> Option<String> {
+        let d = self.install_date.as_deref()?.trim();
+        let digits: String = d.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() == 8 {
+            let iso = format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..]);
+            if chrono::NaiveDate::parse_from_str(&iso, "%Y-%m-%d").is_ok() {
+                return Some(iso);
+            }
+        }
+        None
+    }
+}
+
+/// Group-friendly product name: drops version numbers, architecture/language tags and
+/// "(remove only)"-style suffixes, so "Mozilla Firefox (x64 en-US) 128.0.3" → "Mozilla Firefox".
+pub fn normalize_product(name: &str) -> String {
+    let mut s = name.trim().to_string();
+    // Drop bracketed tags: (x64 en-US), (64-bit), [Remove only] …
+    loop {
+        let before = s.clone();
+        for (o, c) in [('(', ')'), ('[', ']')] {
+            if let (Some(i), Some(j)) = (s.rfind(o), s.rfind(c)) {
+                if i < j && j == s.len() - c.len_utf8() {
+                    s.truncate(i);
+                    s = s.trim_end().to_string();
+                }
+            }
+        }
+        // Drop trailing version-like tokens: 128.0.3, v2.1, 2019, x64, 64-bit, -
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if let Some(last) = toks.last() {
+            let l = last.to_lowercase();
+            let versiony = l.trim_start_matches('v').chars().all(|c| c.is_ascii_digit() || c == '.') && l.chars().any(|c| c.is_ascii_digit()) && (l.contains('.') || l.starts_with('v'));
+            if toks.len() > 1 && (versiony || ["x64", "x86", "64-bit", "32-bit", "-", "–"].contains(&l.as_str())) {
+                s = toks[..toks.len() - 1].join(" ");
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s.trim_end_matches([' ', '-', ',']).to_string()
+}
+
+/// "Microsoft Corporation" → "Microsoft", "Google LLC" → "Google".
+pub fn normalize_publisher(p: &str) -> String {
+    let mut s = p.trim().trim_end_matches('.').to_string();
+    for suffix in [", Inc", " Inc", " Corporation", " Corp", " LLC", " Ltd", " Limited", " GmbH", " Incorporated", " Co"] {
+        if s.len() > suffix.len() && s.to_lowercase().ends_with(&suffix.to_lowercase()) {
+            s.truncate(s.len() - suffix.len());
+            s = s.trim_end_matches([',', '.', ' ']).to_string();
+        }
+    }
+    s
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Service {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub state: Option<String>,
+    pub start_mode: Option<String>,
+    pub start_name: Option<String>,
+    pub path: Option<String>,
+}
+
+impl Service {
+    /// Unquoted executable path containing spaces — a classic privilege-escalation finding.
+    pub fn unquoted_path(&self) -> bool {
+        let Some(p) = self.path.as_deref().map(str::trim) else { return false };
+        if p.starts_with('"') {
+            return false;
+        }
+        match p.to_lowercase().find(".exe") {
+            Some(i) => p[..i].contains(' '),
+            None => false,
+        }
+    }
+
+    /// Runs as a real account (domain/local user) rather than a built-in service identity.
+    pub fn custom_account(&self) -> bool {
+        let Some(n) = self.start_name.as_deref().map(|s| s.trim().to_lowercase()) else { return false };
+        !(n.is_empty()
+            || n == "localsystem"
+            || n.starts_with("nt authority\\")
+            || n.starts_with("nt service\\")
+            || n == "localservice"
+            || n == "networkservice")
+    }
 }
 
 /// What `collect.ps1` returns on success.
@@ -73,6 +177,12 @@ pub struct WinInventory {
     pub disks: Vec<Disk>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub nics: Vec<Nic>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub software: Vec<Software>,
+    pub software_error: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub services: Vec<Service>,
+    pub services_error: Option<String>,
 }
 
 impl WinInventory {
@@ -166,12 +276,19 @@ fn categorise(stage: &str, msg: &str) -> CollectError {
 
 /// Parse collect.ps1 output (tolerates warnings/banners before the JSON line).
 pub fn parse_output(stdout: &str) -> std::result::Result<WinInventory, CollectError> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| l.starts_with('{'))
-        .ok_or_else(|| CollectError::Other(format!("collector returned no JSON: {}", stdout.trim().chars().take(300).collect::<String>())))?;
-    let v: serde_json::Value = serde_json::from_str(line).map_err(|e| CollectError::Other(format!("bad collector JSON: {e}")))?;
+    // The JSON object starts at the first line beginning with '{' (warnings may precede it) and may
+    // span several lines; read exactly one JSON value from there.
+    let start = if stdout.trim_start().starts_with('{') {
+        stdout.find('{')
+    } else {
+        stdout.find("\n{").map(|i| i + 1)
+    }
+    .ok_or_else(|| CollectError::Other(format!("collector returned no JSON: {}", stdout.trim().chars().take(300).collect::<String>())))?;
+    let v: serde_json::Value = serde_json::Deserializer::from_str(&stdout[start..])
+        .into_iter::<serde_json::Value>()
+        .next()
+        .ok_or_else(|| CollectError::Other("collector returned no JSON".into()))?
+        .map_err(|e| CollectError::Other(format!("bad collector JSON: {e}")))?;
     if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
         let stage = v.get("stage").and_then(|s| s.as_str()).unwrap_or("collect");
         let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("unknown error");
