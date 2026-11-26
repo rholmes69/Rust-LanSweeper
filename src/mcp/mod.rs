@@ -487,7 +487,9 @@ hardware (manufacturer, model, serial, BIOS, CPU, RAM, disks), OS edition/build,
 logged-on user (fields os, os_build, last_user, memory_mb, min_disk_free_pct, last_boot, inventory_status…), \
 plus installed programs ('software' dataset, from the registry Uninstall keys) and Windows services ('services' \
 dataset, with unquoted-path and custom-account flags), security posture (av_ok, bitlocker_os, firewall_off, \
-reboot_pending, last_patch_date, full_build) and installed updates ('hotfixes' dataset).";
+reboot_pending, last_patch_date, full_build) and installed updates ('hotfixes' dataset). Linux machines are \
+inventoried over SSH with key credentials into the same fields (platform = 'linux'): distribution (os), kernel \
+(os_build), hardware, disks, packages ('software' dataset), systemd services ('services' dataset), reboot required.";
 
 fn docs(q: Option<&str>) -> Value {
     let mut sections: Vec<(String, String)> = vec![("How RustSweeper collects data".into(), DATA_MODEL_DOC.into())];

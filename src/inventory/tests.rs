@@ -80,7 +80,7 @@ fn collector_script_contract() {
 }
 
 fn cred(id: i64, site: Option<i64>) -> Credential {
-    Credential { id, name: format!("c{id}"), kind: "windows".into(), username: "u".into(), secret: "s".into(), site_id: site, site: None, created_at: String::new(), last_success: None }
+    Credential { id, name: format!("c{id}"), kind: "windows".into(), username: "u".into(), secret: "s".into(), key_path: None, site_id: site, site: None, created_at: String::new(), last_success: None }
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn seeded() -> (Db, i64) {
 #[test]
 fn saving_inventory_updates_asset_and_history() {
     let (db, id) = seeded();
-    assert!(is_candidate(&db.get_asset(id).unwrap().unwrap()));
+    assert_eq!(platform_of(&db.get_asset(id).unwrap().unwrap()), Some(Platform::Windows));
     // IT already entered a model; inventory must not overwrite it, but fills the blank serial.
     db.update_asset_fields(id, &[("model".into(), Some("OptiPlex (front desk)".into()))]).unwrap();
     let inv = parse_output(SAMPLE).unwrap();
@@ -380,4 +380,42 @@ async fn protection_is_stored_queried_and_tracked() {
     fixed.protection.as_mut().unwrap().bitlocker = Some(vec![BitLockerVolume { drive: Some("C:".into()), protection_status: Some(1) }]);
     db.save_windows_inventory(id, &fixed, None, "svc").unwrap();
     assert!(db.changes(Some(id), 50).unwrap().iter().any(|c| c.field == "windows: bitlocker" && c.new_value.as_deref() == Some("on")));
+}
+
+#[test]
+fn linux_assets_use_ssh_credentials_and_store_as_linux() {
+    let db = Db::open(":memory:").unwrap();
+    let scan = db.create_scan_for_site("x", "test", None).unwrap();
+    let h = HostResult {
+        ip: "10.20.0.15".parse().unwrap(), alive: true, mac: Some("B8:CA:3A:01:02:03".into()),
+        ssh_banner: Some("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10".into()), os_guess: Some("Linux (Ubuntu)".into()),
+        device_type: Some("Linux/Unix Server".into()), ports: vec![OpenPort { port: 22, service: None, banner: None }], ..Default::default()
+    };
+    let (id, _) = db.record_host(scan, &h).unwrap();
+    let a = db.get_asset(id).unwrap().unwrap();
+    assert_eq!(platform_of(&a), Some(Platform::Linux));
+    assert!(!is_candidate_with(&a, false), "no SSH credential → not attempted automatically");
+    assert!(is_candidate_with(&a, true));
+
+    // Only SSH credentials are tried for Linux, never the Windows ones (and no service-account fallback).
+    let mut ssh = cred(9, None);
+    ssh.kind = "ssh".into();
+    let creds = vec![cred(1, None), ssh];
+    let order = credential_order_kind(&creds, &a, None, false, "ssh");
+    assert_eq!(order.iter().map(|c| c.as_ref().map(|c| c.id)).collect::<Vec<_>>(), vec![Some(9)]);
+
+    // Store what the real collector produces on this machine (runs it under sh, no SSH needed).
+    if cfg!(windows) {
+        return;
+    }
+    let out = std::process::Command::new("sh").arg("-c").arg(linux::COLLECT_SH).output().unwrap();
+    let inv = linux::parse(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    db.save_windows_inventory(id, &inv, None, "linux-key").unwrap();
+    let a = db.get_asset(id).unwrap().unwrap();
+    assert!(a.device_type.as_deref().unwrap().starts_with("Linux Server"));
+    let w = db.windows_inventory(id).unwrap().unwrap();
+    assert_eq!(w["platform"], "linux");
+    assert!(w["software_count"].as_i64().unwrap_or(0) > 0 || w["software_error"].is_string());
+    // Linux machines don't count towards the Windows posture totals.
+    assert!(db.posture_counts().unwrap().iter().all(|c| c.3 == 0));
 }

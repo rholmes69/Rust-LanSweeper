@@ -92,7 +92,8 @@ impl Default for ScanOptions {
             timeout: Duration::from_millis(800),
             snmp_communities: vec!["public".into()],
             ping: true,
-            inventory: crate::inventory::supported().then(crate::inventory::InventoryOptions::default),
+            // On by default: Windows (WMI) when running on Windows; Linux (SSH) wherever SSH credentials exist.
+            inventory: Some(crate::inventory::InventoryOptions::default()),
         }
     }
 }
@@ -286,10 +287,11 @@ pub async fn execute_scan(
     db.reassign_sites()?; // place new / moved assets into their sites
 
     if let Some(inv_opts) = &opts.inventory {
+        let have_ssh = db.list_credentials()?.iter().any(|c| c.kind == "ssh");
         let candidates: Vec<_> = seen_ids
             .iter()
             .filter_map(|id| db.get_asset(*id).ok().flatten())
-            .filter(crate::inventory::is_candidate)
+            .filter(|a| crate::inventory::is_candidate_with(a, have_ssh))
             .collect();
         if !candidates.is_empty() {
             progress.inventory_total.store(candidates.len(), Ordering::Relaxed);

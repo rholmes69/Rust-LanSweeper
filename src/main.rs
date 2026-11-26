@@ -175,7 +175,7 @@ enum Cmd {
         #[command(subcommand)]
         action: CredentialCmd,
     },
-    /// Run credentialed Windows inventory now (Windows only).
+    /// Run credentialed inventory now: Windows over WMI (RustSweeper on Windows) or Linux over SSH.
     Inventory {
         /// Asset id, IP, MAC or name. Omit with --site or --all.
         asset: Option<String>,
@@ -243,6 +243,22 @@ enum CredentialCmd {
         /// DOMAIN\user or user@domain (local accounts: .\Administrator).
         #[arg(long)]
         user: String,
+        /// Only use for assets in this site.
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Add an SSH key credential for Linux inventory. Use --generate to create a new key pair.
+    AddSsh {
+        name: String,
+        /// Linux account to log in as (needs no sudo).
+        #[arg(long)]
+        user: String,
+        /// Existing private key file.
+        #[arg(long, conflicts_with = "generate")]
+        key: Option<String>,
+        /// Create a dedicated ed25519 key pair and print the public key to install.
+        #[arg(long)]
+        generate: bool,
         /// Only use for assets in this site.
         #[arg(long)]
         site: Option<String>,
@@ -459,10 +475,27 @@ async fn main() -> Result<()> {
                 let id = db.add_credential(&name, &user, &secret, site_id)?;
                 println!("Credential #{id} '{name}' saved (password encrypted with Windows DPAPI on this machine).");
             }
+            CredentialCmd::AddSsh { name, user, key, generate, site } => {
+                let site_id = match &site {
+                    Some(s) => Some(db.find_site(s)?.with_context(|| format!("no site '{s}'"))?.id),
+                    None => None,
+                };
+                let key_path = if generate {
+                    let (path, public) = inventory::linux::generate_key(&name)?;
+                    println!("Generated {}\n", path.display());
+                    println!("Add this line to ~{user}/.ssh/authorized_keys on each Linux machine:\n\n  {public}\n");
+                    path.display().to_string()
+                } else {
+                    key.context("give --key <private key file> or --generate")?
+                };
+                let id = db.add_ssh_credential(&name, &user, &key_path, site_id)?;
+                println!("SSH credential #{id} '{name}' saved (key file: {key_path}). Host keys are pinned in {}.",
+                    inventory::linux::known_hosts().display());
+            }
             CredentialCmd::List => {
-                println!("{:<4} {:<20} {:<30} {:<16} LAST SUCCESS", "ID", "NAME", "USER", "SITE");
+                println!("{:<4} {:<20} {:<8} {:<30} {:<16} LAST SUCCESS", "ID", "NAME", "KIND", "USER", "SITE");
                 for c in db.list_credentials()? {
-                    println!("{:<4} {:<20} {:<30} {:<16} {}", c.id, trunc(&c.name, 20), trunc(&c.username, 30),
+                    println!("{:<4} {:<20} {:<8} {:<30} {:<16} {}", c.id, trunc(&c.name, 20), c.kind, trunc(&c.username, 30),
                         c.site.as_deref().unwrap_or("all sites"), c.last_success.as_deref().unwrap_or("never"));
                 }
             }
@@ -474,16 +507,13 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Inventory { asset, site, all, protocol, no_integrated_auth } => {
-            if !inventory::supported() {
-                bail!("Windows inventory needs RustSweeper running on Windows");
-            }
             let assets = match (asset, site, all) {
                 (Some(a), _, _) => vec![find_asset(&db, &a)?],
                 (None, Some(s), _) => {
                     let id = db.find_site(&s)?.with_context(|| format!("no site '{s}'"))?.id;
-                    db.list_assets(&AssetFilter { site_id: Some(id), ..Default::default() })?.into_iter().filter(inventory::is_candidate).collect()
+                    db.list_assets(&AssetFilter { site_id: Some(id), ..Default::default() })?.into_iter().filter(|a| inventory::is_candidate_with(a, true)).collect()
                 }
-                (None, None, true) => db.list_assets(&AssetFilter::default())?.into_iter().filter(inventory::is_candidate).collect(),
+                (None, None, true) => db.list_assets(&AssetFilter::default())?.into_iter().filter(|a| inventory::is_candidate_with(a, true)).collect(),
                 _ => bail!("give an asset, --site NAME or --all"),
             };
             println!("Inventorying {} device(s)…", assets.len());

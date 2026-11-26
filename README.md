@@ -112,6 +112,23 @@ each check; changes in antivirus, BitLocker or firewall state are logged. AI ass
 days*, *restart pending* and *Windows builds in use*. Checks that need features a device doesn't
 have (e.g. BitLocker on Windows Home, Security Center on Server) show as unknown rather than failing.
 
+**Linux over SSH.** Linux machines are inventoried with SSH keys (no passwords) using the
+OpenSSH client built into Windows 10+/Server 2019+ (`ssh.exe`): distribution, kernel, hardware
+(DMI), CPU/RAM, disks, network adapters, logged-in user, installed packages (dpkg, rpm or apk),
+systemd services and whether a reboot is required — all in the same views and AI datasets as
+Windows (`platform = linux`). The collector is a plain POSIX shell script and needs no sudo.
+
+```sh
+rustsweeper credential add-ssh "Linux servers" --user rustsweeper --generate
+# → creates a dedicated ed25519 key under C:\ProgramData\RustSweeper\keys and prints the public key;
+#   add it to ~rustsweeper/.ssh/authorized_keys on each machine
+rustsweeper inventory 10.10.5.20
+```
+
+Host keys are trusted on first connection and pinned in `C:\ProgramData\RustSweeper\known_hosts`;
+if one changes later, inventory stops with a warning instead of connecting. Machines are tried
+automatically after scans when they have SSH open and at least one SSH credential exists.
+
 **Credentials.** Use an account that is a local administrator on your PCs — usually a dedicated
 domain account (e.g. `DELTA\svc-rustsweeper`) added to local Administrators by Group Policy. Add it
 on the **Credentials** page or:
@@ -300,8 +317,8 @@ nssm start RustSweeper
 - Per-scan limit is 65,536 addresses (a /16).
 - Basic auth sends credentials in clear text; put it behind HTTPS (IIS/nginx reverse proxy)
   if it's reachable beyond the IT VLAN.
-- Credentialed inventory covers Windows hardware, OS, user, software, services, security posture
-  and installed updates; Linux (SSH) comes next.
+- Credentialed inventory covers Windows (WMI) and Linux (SSH keys). Linux SSH must listen on port
+  22; key file permissions must be owner-only (generated keys are set up correctly).
 - Devices identified only by their ping TTL are labelled conservatively (Unidentified/Mobile/
   Linux-based device) — a TTL of 64 alone doesn't mean "server". Credentialed inventory (installed software,
   hardware specs via WMI/WinRM, SSH) or an endpoint agent are natural next steps.
@@ -326,6 +343,7 @@ src/
   inventory/
     mod.rs             credentialed Windows inventory (credential order, storage)
     collect.ps1        PowerShell/CIM collector run on the RustSweeper host
+    linux.rs, linux.sh SSH collector (ssh.exe + POSIX shell script)
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

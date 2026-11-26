@@ -14,6 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::db::{Asset, Credential, Db};
 
+pub mod linux;
+
 const COLLECT_PS: &str = include_str!("collect.ps1");
 
 const PROTECT_PS: &str = r#"$ErrorActionPreference = 'Stop'
@@ -314,6 +316,9 @@ pub struct WinInventory {
     pub services: Vec<Service>,
     pub services_error: Option<String>,
     pub protection: Option<Protection>,
+    /// "windows" (default) or "linux".
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 impl WinInventory {
@@ -330,6 +335,10 @@ impl WinInventory {
                 _ => None,
             })
             .reduce(f64::min)
+    }
+
+    pub fn is_linux(&self) -> bool {
+        self.platform.as_deref() == Some("linux")
     }
 
     pub fn is_server(&self) -> bool {
@@ -527,19 +536,59 @@ impl Default for InventoryOptions {
     }
 }
 
-/// Does this asset look like something WMI inventory applies to?
-pub fn is_candidate(a: &Asset) -> bool {
-    if a.status == "offline" || a.ip.is_empty() {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Windows,
+    Linux,
+}
+
+/// Which credentialed inventory applies to an asset, if any.
+pub fn platform_of(a: &Asset) -> Option<Platform> {
+    if a.ip.is_empty() {
+        return None;
     }
     let os = a.os_guess.as_deref().unwrap_or("");
     let t = a.device_type.as_deref().unwrap_or("");
-    os.starts_with("Windows") || t.starts_with("Windows") || a.netbios_name.is_some()
+    if os.contains("Windows") || t.starts_with("Windows") || a.netbios_name.is_some() {
+        Some(Platform::Windows)
+    } else if a.ssh_banner.is_some() || os.starts_with("Linux") || os.contains("Ubuntu") || os.contains("Debian") || t.starts_with("Linux") {
+        // SSH reachable and not Windows. (Network gear also runs SSH; it simply fails or is skipped
+        // when no SSH credential is configured.)
+        let banner = a.ssh_banner.as_deref().unwrap_or("").to_lowercase();
+        if banner.contains("cisco") || t == "Network Device" || t == "Printer" {
+            None
+        } else {
+            Some(Platform::Linux)
+        }
+    } else {
+        None
+    }
 }
+
+/// Should this asset be inventoried automatically after a scan?
+/// Windows needs RustSweeper on Windows; Linux needs at least one SSH credential.
+pub fn is_candidate_with(a: &Asset, have_ssh_creds: bool) -> bool {
+    if a.status == "offline" {
+        return false;
+    }
+    match platform_of(a) {
+        Some(Platform::Windows) => supported(),
+        Some(Platform::Linux) => have_ssh_creds,
+        None => false,
+    }
+}
+
+
 
 /// Credentials to try for an asset, in order: the one that worked last time, site-specific,
 /// global, then (optionally) the service's own account (`None`).
 pub fn credential_order(creds: &[Credential], a: &Asset, last_ok: Option<i64>, integrated: bool) -> Vec<Option<Credential>> {
+    credential_order_kind(creds, a, last_ok, integrated, "windows")
+}
+
+pub fn credential_order_kind(creds: &[Credential], a: &Asset, last_ok: Option<i64>, integrated: bool, kind: &str) -> Vec<Option<Credential>> {
+    let creds: Vec<Credential> = creds.iter().filter(|c| c.kind == kind).cloned().collect();
+    let creds = creds.as_slice();
     let mut list: Vec<Option<Credential>> = Vec::new();
     let mut push = |c: &Credential| {
         if !list.iter().any(|x| x.as_ref().map(|x| x.id) == Some(c.id)) {
@@ -575,17 +624,29 @@ pub struct Outcome {
 /// Inventory one asset, trying credentials in order; records success or the error on the asset.
 pub async fn inventory_asset(db: &Db, a: &Asset, opts: &InventoryOptions) -> Result<Outcome> {
     let creds = db.list_credentials_with_secrets()?;
-    let order = credential_order(&creds, a, db.last_inventory_credential(a.id)?, opts.integrated_auth);
+    let platform = platform_of(a).unwrap_or(Platform::Windows);
+    let order = match platform {
+        Platform::Windows => credential_order(&creds, a, db.last_inventory_credential(a.id)?, opts.integrated_auth),
+        Platform::Linux => credential_order_kind(&creds, a, db.last_inventory_credential(a.id)?, false, "ssh"),
+    };
     let name = a.display_name();
     if order.is_empty() {
-        let msg = "no credentials configured (add one, or allow the service account)".to_string();
+        let msg = match platform {
+            Platform::Windows => "no credentials configured (add one, or allow the service account)".to_string(),
+            Platform::Linux => "no SSH credential configured (rustsweeper credential add-ssh …)".to_string(),
+        };
         db.record_inventory_error(a.id, &msg)?;
         return Ok(Outcome { asset_id: a.id, name, ok: false, credential: None, message: msg });
     }
     let mut errors = Vec::new();
     for cred in &order {
         let label = cred.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "service account".into());
-        match collect(&a.ip, cred.as_ref(), &opts.protocol).await {
+        let result = match (platform, cred) {
+            (Platform::Linux, Some(c)) => linux::collect(&a.ip, &c.username, c.key_path.as_deref().unwrap_or("")).await,
+            (Platform::Linux, None) => Err(CollectError::Other("no SSH credential".into())),
+            (Platform::Windows, _) => collect(&a.ip, cred.as_ref(), &opts.protocol).await,
+        };
+        match result {
             Ok(inv) => {
                 // Make sure the IP still belongs to the device we think it does.
                 if let (Some(nb), Some(cn)) = (&a.netbios_name, &inv.computer_name) {

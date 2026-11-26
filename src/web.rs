@@ -89,6 +89,7 @@ pub fn router(state: AppState) -> Router {
         .route("/posture/{check}", get(posture_page))
         .route("/credentials", get(credentials_page).post(add_credential))
         .route("/credentials/{id}/delete", post(delete_credential))
+        .route("/credentials/ssh", post(add_ssh_credential))
         .route("/assets/{id}/delete", post(delete_asset))
         .route("/assets/{id}/site", post(set_asset_site))
         .route("/sites", get(sites_page).post(add_site))
@@ -1175,7 +1176,7 @@ fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
         if status.is_empty() {
             return String::new();
         }
-        return format!("<div class=card><h2>Windows inventory</h2>{status}<p class=hint>Check <a href=/credentials>credentials</a>, then use Inventory now.</p></div>");
+        return format!("<div class=card><h2>Inventory</h2>{status}<p class=hint>Check <a href=/credentials>credentials</a>, then use Inventory now.</p></div>");
     };
     let t = |k: &str| w.get(k).and_then(|v| v.as_str()).map(esc).unwrap_or_else(|| "<span class=muted>—</span>".into());
     let n = |k: &str| w.get(k).and_then(|v| v.as_i64());
@@ -1222,11 +1223,12 @@ fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
         })
         .unwrap_or_default();
     format!(
-        "<div class=card><h2>Windows inventory <span class=muted style='font-weight:400'>· {} via {}</span></h2>{status}\
+        "<div class=card><h2>{} inventory <span class=muted style='font-weight:400'>· {} via {}</span></h2>{status}\
          <div class='grid g2' style='gap:8px 24px'><dl>{}</dl><dl>{}</dl></div>\
          {}\
          <h2 style='margin-top:14px'>Disks</h2><table><tr><th>Drive</th><th>FS</th><th>Size</th><th>Free</th></tr>{}</table>\
          <h2 style='margin-top:14px'>Network adapters</h2><table><tr><th>Adapter</th><th>MAC</th><th>IPs</th></tr>{}</table></div>",
+        if w.get("platform").and_then(|p| p.as_str()) == Some("linux") { "Linux" } else { "Windows" },
         t("collected_at"), t("credential"),
         [
             row("Computer", format!("{} <span class=muted>{}</span>", t("computer_name"), t("domain"))),
@@ -1388,9 +1390,16 @@ fn security_html(w: &serde_json::Value) -> String {
 
 async fn inventory_now(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
     let Some(a) = st.db.get_asset(id)? else { return Ok(not_found()) };
-    if !crate::inventory::supported() {
-        return Ok(form_error("Inventory unavailable", "assets",
-            &anyhow::anyhow!("Windows inventory needs RustSweeper running on Windows (it uses Windows PowerShell and WMI)."), &format!("/assets/{id}")));
+    match crate::inventory::platform_of(&a) {
+        Some(crate::inventory::Platform::Windows) if !crate::inventory::supported() => {
+            return Ok(form_error("Inventory unavailable", "assets",
+                &anyhow::anyhow!("Windows inventory needs RustSweeper running on Windows (it uses Windows PowerShell and WMI)."), &format!("/assets/{id}")));
+        }
+        None => {
+            return Ok(form_error("Inventory unavailable", "assets",
+                &anyhow::anyhow!("This device doesn't look like Windows or an SSH-reachable Linux machine."), &format!("/assets/{id}")));
+        }
+        _ => {}
     }
     let opts = st.opts.inventory.clone().unwrap_or_default();
     let db = st.db.clone();
@@ -1411,9 +1420,11 @@ async fn credentials_page(State(st): State<AppState>) -> WebResult<Html<String>>
     let rows: String = creds
         .iter()
         .map(|c| format!(
-            "<tr><td>{}</td><td class=mono>{}</td><td>{}</td><td class=muted>{}</td><td class=muted>{}</td>\
+            "<tr><td>{}</td><td>{}</td><td class=mono>{}</td><td>{}</td><td class=muted>{}</td><td class=muted>{}</td>\
              <td><form class=inline method=post action='/credentials/{}/delete' onsubmit=\"return confirm('Delete this credential?')\"><button class=danger>Delete</button></form></td></tr>",
-            esc(&c.name), esc(&c.username), c.site.as_deref().map(esc).unwrap_or_else(|| "All sites".into()),
+            esc(&c.name),
+            if c.kind == "ssh" { format!("SSH key <span class='muted mono' title='{}'>🔑</span>", esc(c.key_path.as_deref().unwrap_or(""))) } else { "Windows".into() },
+            esc(&c.username), c.site.as_deref().map(esc).unwrap_or_else(|| "All sites".into()),
             esc(&c.created_at), opt(&c.last_success), c.id
         ))
         .collect();
@@ -1445,11 +1456,19 @@ async fn credentials_page(State(st): State<AppState>) -> WebResult<Html<String>>
            <input type=text name=username placeholder='DELTA\\svc-rustsweeper' required>\
            <input type=password name=password placeholder='Password' required autocomplete=new-password>\
            <select name=site_id><option value=''>All sites</option>{}</select><button>Save</button></form></div>\
-         <div class=card style='padding:0'><table><tr><th>Name</th><th>User</th><th>Applies to</th><th>Added</th><th>Last success</th><th></th></tr>{}</table></div>\
+         <div class=card><h2>Add SSH key (Linux)</h2><form method=post action=/credentials/ssh class=row autocomplete=off>\
+           <input type=text name=name placeholder='Name (e.g. Linux servers)' required>\
+           <input type=text name=username placeholder='Linux user, e.g. rustsweeper' required>\
+           <input type=text name=key_path placeholder='Private key file on this server' required style='flex:1;min-width:240px'>\
+           <select name=site_id><option value=''>All sites</option>{}</select><button>Save</button></form>\
+           <div class=hint>Key-based only. Easiest: <code>rustsweeper credential add-ssh \"Linux servers\" --user rustsweeper --generate</code> creates a key and prints the public key \
+           to add to <code>~/.ssh/authorized_keys</code> on each machine. No sudo is needed. Host keys are trusted on first connection and then pinned.</div></div>\
+         <div class=card style='padding:0'><table><tr><th>Name</th><th>Type</th><th>User</th><th>Applies to</th><th>Added</th><th>Last success</th><th></th></tr>{}</table></div>\
          <div class=card style='padding:0;overflow-x:auto'><h2 style='padding:16px 16px 0'>Inventory problems</h2>\
            <table><tr><th>Asset</th><th>IP</th><th>Site</th><th>When</th><th>Error</th></tr>{}</table></div>",
         sites.iter().map(|x| format!("<option value='{}'>{}</option>", x.id, esc(&x.name))).collect::<String>(),
-        if rows.is_empty() { "<tr><td colspan=6 class=muted>No stored credentials</td></tr>".into() } else { rows },
+        sites.iter().map(|x| format!("<option value='{}'>{}</option>", x.id, esc(&x.name))).collect::<String>(),
+        if rows.is_empty() { "<tr><td colspan=7 class=muted>No stored credentials</td></tr>".into() } else { rows },
         if issues.is_empty() { "<tr><td colspan=5 class=muted>No problems</td></tr>".into() } else { issues },
     )))
 }
@@ -1475,6 +1494,22 @@ async fn add_credential(State(st): State<AppState>, Form(f): Form<CredentialForm
     Ok(match res {
         Ok(_) => Redirect::to("/credentials").into_response(),
         Err(e) => form_error("Could not save credential", "credentials", &e, "/credentials"),
+    })
+}
+
+#[derive(Deserialize)]
+struct SshCredentialForm {
+    name: String,
+    username: String,
+    key_path: String,
+    #[serde(default)]
+    site_id: String,
+}
+
+async fn add_ssh_credential(State(st): State<AppState>, Form(f): Form<SshCredentialForm>) -> WebResult<Response> {
+    Ok(match st.db.add_ssh_credential(&f.name, &f.username, &f.key_path, f.site_id.trim().parse().ok()) {
+        Ok(_) => Redirect::to("/credentials").into_response(),
+        Err(e) => form_error("Could not save SSH credential", "credentials", &e, "/credentials"),
     })
 }
 
