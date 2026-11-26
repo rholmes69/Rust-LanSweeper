@@ -90,7 +90,9 @@ pub fn normalize_product(name: &str) -> String {
         if let Some(last) = toks.last() {
             let l = last.to_lowercase();
             let versiony = l.trim_start_matches('v').chars().all(|c| c.is_ascii_digit() || c == '.') && l.chars().any(|c| c.is_ascii_digit()) && (l.contains('.') || l.starts_with('v'));
-            if toks.len() > 1 && (versiony || ["x64", "x86", "64-bit", "32-bit", "-", "–"].contains(&l.as_str())) {
+            // Locale tags such as en-us / fr-FR.
+            let locale = l.len() == 5 && l.as_bytes()[2] == b'-' && l.chars().filter(|c| c.is_ascii_alphabetic()).count() == 4;
+            if toks.len() > 1 && (versiony || locale || ["x64", "x86", "64-bit", "32-bit", "-", "–", "version"].contains(&l.as_str())) {
                 s = toks[..toks.len() - 1].join(" ");
             }
         }
@@ -236,11 +238,14 @@ where
         Wrapped {
             value: Vec<T>,
         },
+        // A list nested in a list (PowerShell's unary-comma array wrapping).
+        Nested(Vec<Vec<T>>),
         One(T),
         None,
     }
     Ok(match Option::<OneOrMany<T>>::deserialize(d)? {
         Some(OneOrMany::Many(v)) | Some(OneOrMany::Wrapped { value: v }) => v,
+        Some(OneOrMany::Nested(v)) => v.into_iter().flatten().collect(),
         Some(OneOrMany::One(t)) => vec![t],
         _ => vec![],
     })

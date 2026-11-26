@@ -189,6 +189,9 @@ fn product_and_publisher_normalisation() {
     assert_eq!(normalize_product("Notepad++ (64-bit x64)"), "Notepad++");
     assert_eq!(normalize_product("Adobe Acrobat Reader DC"), "Adobe Acrobat Reader DC");
     assert_eq!(normalize_product("Microsoft Office 2019"), "Microsoft Office 2019", "years are part of product names");
+    assert_eq!(normalize_product("Git LFS version 3.5.1"), "Git LFS");
+    assert_eq!(normalize_product("Microsoft 365 - en-us"), "Microsoft 365");
+    assert_eq!(normalize_product("ACE Studio version 1.9"), "ACE Studio");
     assert_eq!(normalize_publisher("Microsoft Corporation"), "Microsoft");
     assert_eq!(normalize_publisher("Google LLC"), "Google");
     assert_eq!(normalize_publisher("Adobe Inc."), "Adobe");
@@ -290,4 +293,15 @@ fn parses_ps51_wrapped_arrays() {
     assert_eq!(inv.disks[0].drive.as_deref(), Some("C:"));
     assert_eq!(inv.nics[0].ips, vec!["192.168.4.25"]);
     assert!(COLLECT_PS.contains("Remove-TypeData System.Array"));
+}
+
+/// Seen on Windows 11 / PS 5.1: the software list arrived as a list inside a list.
+#[test]
+fn parses_nested_software_list() {
+    let out = r#"{"ok":true,"software":[[{"name":"Obsidian","version":"1.11.7","publisher":"Obsidian","install_date":null,"arch":"x64"},
+{"name":"Audacity 3.7.5","version":"3.7.5","publisher":"Audacity Team","install_date":"20251205","arch":"x64"}]],"services":[]}"#;
+    let inv = parse_output(out).unwrap();
+    assert_eq!(inv.software.len(), 2);
+    assert_eq!(normalize_product(&inv.software[1].name), "Audacity");
+    assert!(!COLLECT_PS.contains(", $list.ToArray()"), "collector must not comma-wrap the software list");
 }

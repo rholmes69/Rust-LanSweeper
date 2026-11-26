@@ -50,7 +50,9 @@ function Get-Software($session) {
             })
         }
     }
-    , $list.ToArray()
+    # Emit items normally; the caller collects them with @(...). (A leading comma here would make
+    # the caller receive a list nested inside a list.)
+    $list.ToArray()
 }
 
 function Unprotect($blob) {
