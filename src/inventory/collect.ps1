@@ -8,6 +8,9 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8   # RustSweeper reads stdout as UTF-8
+# Windows PowerShell 5.1 attaches an extra 'Count' property to arrays, which makes ConvertTo-Json
+# emit some arrays as {"value":[...],"Count":n}. Removing that type data gives plain JSON arrays.
+Remove-TypeData System.Array -ErrorAction SilentlyContinue
 
 function Out-Result($obj) { $obj | ConvertTo-Json -Depth 5 -Compress; exit 0 }
 function Fail($stage, $err) { Out-Result ([pscustomobject]@{ ok = $false; stage = $stage; error = "$err" }) }
@@ -47,7 +50,9 @@ function Get-Software($session) {
             })
         }
     }
-    , $list.ToArray()
+    # Emit items normally; the caller collects them with @(...). (A leading comma here would make
+    # the caller receive a list nested inside a list.)
+    $list.ToArray()
 }
 
 function Unprotect($blob) {
