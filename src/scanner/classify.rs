@@ -61,7 +61,8 @@ pub fn classify(h: &HostResult) -> (Option<String>, Option<String>) {
     if os.is_none() && h.netbios_name.is_some() && (has(445) || has(135) || has(3389)) {
         os = Some("Windows".into());
     }
-    if os.is_none() && (has(3389) || (has(135) && has(445)) || has(5985)) {
+    // TCP 135 (MS-RPC endpoint mapper) is effectively Windows-only.
+    if os.is_none() && (has(3389) || has(135) || has(5985)) {
         os = Some("Windows".into());
     }
     if os.is_none() && vendor.contains("apple") {
@@ -121,6 +122,9 @@ pub fn classify(h: &HostResult) -> (Option<String>, Option<String>) {
         let server_ports = [22, 25, 53, 389, 1433, 3306, 5432, 8443].iter().any(|p| has(*p));
         dtype = Some(if vendor.contains("raspberry") {
             "Raspberry Pi".into()
+        } else if ttl_only && has(53) && (has(80) || has(443)) && !has(22) {
+            // DNS plus a web admin page and nothing else: a home/office router or firewall.
+            "Network Device".into()
         } else if !ttl_only || server_ports {
             "Linux/Unix Server".into()
         } else if vendor.contains("private/randomized") {
@@ -191,5 +195,14 @@ mod tests {
         let mut h = host(&[7000]);
         h.ttl = Some(64);
         assert_eq!(classify(&h).0.as_deref(), Some("Linux/Unix-based Device"));
+    }
+
+    #[test]
+    fn routers_and_rpc_only_windows() {
+        let mut h = host(&[53, 80]);
+        h.ttl = Some(64);
+        assert_eq!(classify(&h).0.as_deref(), Some("Network Device"));
+        let h = host(&[135]);
+        assert_eq!(classify(&h), (Some("Windows Workstation".into()), Some("Windows".into())));
     }
 }

@@ -548,6 +548,9 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("windows_inventory", "display_version", "TEXT"),
     ("windows_inventory", "ubr", "INTEGER"),
     ("windows_inventory", "protection_errors", "TEXT"),
+    // Phase 3d: Linux over SSH
+    ("windows_inventory", "platform", "TEXT NOT NULL DEFAULT 'windows'"),
+    ("credentials", "key_path", "TEXT"),
 ];
 
 /// SQL expression for an asset's display name (alias `a`). Keep in sync with `Asset::display_name`.
@@ -1288,6 +1291,8 @@ pub struct Credential {
     pub username: String,
     #[serde(skip)]
     pub secret: String,
+    /// SSH credentials: path to the private key file (never the key itself).
+    pub key_path: Option<String>,
     pub site_id: Option<i64>,
     pub site: Option<String>,
     pub created_at: String,
@@ -1311,7 +1316,7 @@ impl Db {
         let conn = self.lock();
         let mut st = conn.prepare(
             "SELECT c.id, c.name, c.kind, c.username, c.secret, c.site_id, (SELECT s.name FROM sites s WHERE s.id = c.site_id), \
-                    c.created_at, c.last_success FROM credentials c ORDER BY c.name COLLATE NOCASE",
+                    c.created_at, c.last_success, c.key_path FROM credentials c ORDER BY c.name COLLATE NOCASE",
         )?;
         let rows = st.query_map([], |r| {
             Ok(Credential {
@@ -1324,6 +1329,7 @@ impl Db {
                 site: r.get(6)?,
                 created_at: r.get(7)?,
                 last_success: r.get(8)?,
+                key_path: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1343,6 +1349,24 @@ impl Db {
         conn.execute(
             "INSERT INTO credentials (name, username, secret, site_id, created_at) VALUES (?1,?2,?3,?4,?5)",
             params![name, username, protected_secret, site_id, now()],
+        )
+        .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("a credential named '{name}' already exists") } else { e.into() })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Add an SSH key credential. Only the key's path is stored.
+    pub fn add_ssh_credential(&self, name: &str, username: &str, key_path: &str, site_id: Option<i64>) -> Result<i64> {
+        let (name, username, key_path) = (name.trim(), username.trim(), key_path.trim());
+        if name.is_empty() || username.is_empty() || key_path.is_empty() {
+            anyhow::bail!("name, username and key file are required");
+        }
+        if !std::path::Path::new(key_path).is_file() {
+            anyhow::bail!("key file '{key_path}' not found");
+        }
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO credentials (name, kind, username, secret, key_path, site_id, created_at) VALUES (?1,'ssh',?2,'',?3,?4,?5)",
+            params![name, username, key_path, site_id, now()],
         )
         .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("a credential named '{name}' already exists") } else { e.into() })?;
         Ok(conn.last_insert_rowid())
@@ -1561,9 +1585,13 @@ impl Db {
         }
         let dtype = format!(
             "{}{}",
-            if inv.is_server() { "Windows Server" } else { "Windows Workstation" },
+            if inv.is_linux() { "Linux Server" } else if inv.is_server() { "Windows Server" } else { "Windows Workstation" },
             if inv.is_virtual() { " (VM)" } else { "" }
         );
+        tx.execute(
+            "UPDATE windows_inventory SET platform=?1 WHERE asset_id=?2",
+            params![if inv.is_linux() { "linux" } else { "windows" }, asset_id],
+        )?;
         tx.execute(
             "UPDATE assets SET os_guess=COALESCE(?1, os_guess), device_type=?2, inventory_status='ok', inventory_error=NULL, \
                inventory_at=?3, inventory_credential_id=?4 WHERE id=?5",
@@ -1666,7 +1694,7 @@ impl Db {
     /// (key, label, failing devices, devices with data) for each posture check.
     pub fn posture_counts(&self) -> Result<Vec<(&'static str, &'static str, i64, i64)>> {
         let conn = self.lock();
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM windows_inventory", [], |r| r.get(0))?;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM windows_inventory WHERE platform='windows'", [], |r| r.get(0))?;
         let mut out = Vec::new();
         for (key, label, cond) in Self::POSTURE_CHECKS {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM windows_inventory w WHERE {cond}"), [], |r| r.get(0))?;
