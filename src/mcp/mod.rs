@@ -458,6 +458,7 @@ fn get_asset(state: &AppState, args: &Value, scope: &Scope) -> Result<Value> {
     Ok(json!({
         "asset": a,
         "custom_fields": db.asset_custom_values(a.id)?.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        "windows_inventory": db.windows_inventory(a.id)?,
         "ports": db.asset_ports(a.id)?,
         "recent_changes": db.changes(Some(a.id), 20)?,
     }))
@@ -475,7 +476,10 @@ by MAC first, then IP; changes are recorded in the 'changes' dataset. A device i
 its IP gets no response. IT can add details the network can't reveal — owner, department, location, serial, model, purchase \
 and warranty dates, asset tag, custom fields — by hand, via CSV import or the API; those edits are logged in \
 'changes' too. Devices the scanner can't see can be added manually (source = manual/import/api). \
-RustSweeper does not log in to devices, so it has no installed-software, user or patch data yet.";
+When RustSweeper runs on Windows with credentials, it also logs in to Windows devices over WMI and records \
+hardware (manufacturer, model, serial, BIOS, CPU, RAM, disks), OS edition/build, install date, last boot and the \
+logged-on user (fields os, os_build, last_user, memory_mb, min_disk_free_pct, last_boot, inventory_status…). \
+Installed software, services and patches are not collected yet.";
 
 fn docs(q: Option<&str>) -> Value {
     let mut sections: Vec<(String, String)> = vec![("How RustSweeper collects data".into(), DATA_MODEL_DOC.into())];

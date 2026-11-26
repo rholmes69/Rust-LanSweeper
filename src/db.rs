@@ -123,6 +123,48 @@ CREATE TABLE IF NOT EXISTS asset_custom_values (
     PRIMARY KEY (asset_id, field_id)
 );
 
+CREATE TABLE IF NOT EXISTS credentials (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    kind          TEXT NOT NULL DEFAULT 'windows',
+    username      TEXT NOT NULL,
+    -- DPAPI (LocalMachine) protected password, base64. Never stored in plain text.
+    secret        TEXT NOT NULL,
+    site_id       INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+    created_at    TEXT NOT NULL,
+    last_success  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS windows_inventory (
+    asset_id            INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+    collected_at        TEXT NOT NULL,
+    credential          TEXT,
+    computer_name       TEXT,
+    domain              TEXT,
+    part_of_domain      INTEGER,
+    manufacturer        TEXT,
+    model               TEXT,
+    system_type         TEXT,
+    serial_number       TEXT,
+    bios_version        TEXT,
+    bios_date           TEXT,
+    os_name             TEXT,
+    os_version          TEXT,
+    os_build            TEXT,
+    os_arch             TEXT,
+    os_install_date     TEXT,
+    last_boot           TEXT,
+    last_user           TEXT,
+    cpu                 TEXT,
+    cpu_count           INTEGER,
+    cores               INTEGER,
+    logical_processors  INTEGER,
+    memory_mb           INTEGER,
+    min_free_pct        REAL,
+    disks               TEXT,
+    nics                TEXT
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -184,6 +226,10 @@ pub struct Asset {
     /// How the scanner last established the device was up (tcp, ping, netbios, snmp, arp).
     pub detected_by: Option<String>,
     pub scan_count: i64,
+    /// Credentialed inventory: "ok", "error" or None (never attempted).
+    pub inventory_status: Option<String>,
+    pub inventory_error: Option<String>,
+    pub inventory_at: Option<String>,
 }
 
 impl Asset {
@@ -349,7 +395,8 @@ const ASSET_COLS: &str = "a.id, a.ip, a.mac, a.vendor, a.hostname, a.netbios_nam
     (SELECT COUNT(*) FROM ports p WHERE p.asset_id = a.id) AS open_ports, \
     a.site_id, (SELECT st.name FROM sites st WHERE st.id = a.site_id), a.site_manual, \
     a.name_override, a.asset_tag, a.serial_number, a.manufacturer, a.model, a.owner, a.department, a.cost_center, \
-    a.location, a.purchase_date, a.po_number, a.supplier, a.warranty_end, a.source, a.detected_by, a.scan_count";
+    a.location, a.purchase_date, a.po_number, a.supplier, a.warranty_end, a.source, a.detected_by, a.scan_count, \
+    a.inventory_status, a.inventory_error, a.inventory_at";
 
 fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -394,6 +441,9 @@ fn asset_from_row(r: &Row) -> rusqlite::Result<Asset> {
         source: r.get(38)?,
         detected_by: r.get(39)?,
         scan_count: r.get(40)?,
+        inventory_status: r.get(41)?,
+        inventory_error: r.get(42)?,
+        inventory_at: r.get(43)?,
     })
 }
 
@@ -441,6 +491,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("assets", "source", "TEXT NOT NULL DEFAULT 'scanner'"),
     ("assets", "detected_by", "TEXT"),
     ("assets", "scan_count", "INTEGER NOT NULL DEFAULT 0"),
+    // Phase 3: credentialed inventory status ("scan errors")
+    ("assets", "inventory_status", "TEXT"),
+    ("assets", "inventory_error", "TEXT"),
+    ("assets", "inventory_at", "TEXT"),
+    ("assets", "inventory_credential_id", "INTEGER"),
 ];
 
 /// SQL expression for an asset's display name (alias `a`). Keep in sync with `Asset::display_name`.
@@ -748,8 +803,13 @@ impl Db {
                 (id, true)
             }
             Some(id) => {
+                let has_inventory: bool =
+                    tx.prepare("SELECT 1 FROM windows_inventory WHERE asset_id=?1")?.exists([id])?;
                 for (col, val) in &fields {
                     let Some(new) = val else { continue }; // never erase data we failed to re-collect
+                    if has_inventory && (*col == "os_guess" || *col == "device_type") {
+                        continue; // credentialed inventory knows better than port fingerprinting
+                    }
                     let old: Option<String> =
                         tx.query_row(&format!("SELECT {col} FROM assets WHERE id=?1"), [id], |r| r.get(0))?;
                     if old.as_deref() != Some(new.as_str()) {
@@ -1164,6 +1224,223 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+/// Stored login used for credentialed inventory. `secret` is DPAPI-protected and never serialised.
+#[derive(Debug, Clone, Serialize)]
+pub struct Credential {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub username: String,
+    #[serde(skip)]
+    pub secret: String,
+    pub site_id: Option<i64>,
+    pub site: Option<String>,
+    pub created_at: String,
+    pub last_success: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryIssue {
+    pub asset_id: i64,
+    pub name: String,
+    pub ip: String,
+    pub site: Option<String>,
+    pub at: Option<String>,
+    pub error: String,
+}
+
+impl Db {
+    // ---------------------------------------------------------------- credentials
+
+    pub fn list_credentials_with_secrets(&self) -> Result<Vec<Credential>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT c.id, c.name, c.kind, c.username, c.secret, c.site_id, (SELECT s.name FROM sites s WHERE s.id = c.site_id), \
+                    c.created_at, c.last_success FROM credentials c ORDER BY c.name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(Credential {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                username: r.get(3)?,
+                secret: r.get(4)?,
+                site_id: r.get(5)?,
+                site: r.get(6)?,
+                created_at: r.get(7)?,
+                last_success: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Credentials for display (secrets blanked).
+    pub fn list_credentials(&self) -> Result<Vec<Credential>> {
+        Ok(self.list_credentials_with_secrets()?.into_iter().map(|mut c| { c.secret.clear(); c }).collect())
+    }
+
+    pub fn add_credential(&self, name: &str, username: &str, protected_secret: &str, site_id: Option<i64>) -> Result<i64> {
+        let (name, username) = (name.trim(), username.trim());
+        if name.is_empty() || username.is_empty() {
+            anyhow::bail!("name and username are required");
+        }
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO credentials (name, username, secret, site_id, created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![name, username, protected_secret, site_id, now()],
+        )
+        .map_err(|e| if e.to_string().contains("UNIQUE") { anyhow::anyhow!("a credential named '{name}' already exists") } else { e.into() })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_credential(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("UPDATE assets SET inventory_credential_id = NULL WHERE inventory_credential_id = ?1", [id])?;
+        conn.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn last_inventory_credential(&self, asset_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row("SELECT inventory_credential_id FROM assets WHERE id=?1", [asset_id], |r| r.get(0))
+            .optional()?
+            .flatten())
+    }
+
+    // ---------------------------------------------------------------- Windows inventory
+
+    pub fn record_inventory_error(&self, asset_id: i64, error: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE assets SET inventory_status='error', inventory_error=?1, inventory_at=?2 WHERE id=?3",
+            params![error.chars().take(1000).collect::<String>(), now(), asset_id],
+        )?;
+        Ok(())
+    }
+
+    /// Store a successful collection: upsert the inventory row, log meaningful changes, fill
+    /// empty asset details (never overwriting what IT entered) and set OS/type from the source.
+    pub fn save_windows_inventory(
+        &self,
+        asset_id: i64,
+        inv: &crate::inventory::WinInventory,
+        credential_id: Option<i64>,
+        credential_label: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let ts = now();
+        let old: Option<(Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT os_name, os_build, memory_mb, cpu, serial_number FROM windows_inventory WHERE asset_id=?1",
+                [asset_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let serial = inv.real_serial();
+        if let Some((os, build, mem, cpu, sn)) = &old {
+            let pairs: [(&str, Option<String>, Option<String>); 5] = [
+                ("windows: os", os.clone(), inv.os_name.clone()),
+                ("windows: build", build.clone(), inv.os_build.clone()),
+                ("windows: memory_mb", mem.map(|m| m.to_string()), inv.memory_mb().map(|m| m.to_string())),
+                ("windows: cpu", cpu.clone(), inv.cpu.clone()),
+                ("windows: serial", sn.clone(), serial.clone()),
+            ];
+            for (field, o, n) in pairs {
+                if n.is_some() && o != n {
+                    tx.execute(
+                        "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,?3,?4,?5)",
+                        params![asset_id, ts, field, o, n],
+                    )?;
+                }
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'windows: inventoried',NULL,?3)",
+                params![asset_id, ts, inv.os_name],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO windows_inventory (asset_id, collected_at, credential, computer_name, domain, part_of_domain, \
+               manufacturer, model, system_type, serial_number, bios_version, bios_date, os_name, os_version, os_build, os_arch, \
+               os_install_date, last_boot, last_user, cpu, cpu_count, cores, logical_processors, memory_mb, min_free_pct, disks, nics) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
+            rusqlite::params![
+                asset_id, ts, credential_label, inv.computer_name, inv.domain, inv.part_of_domain as i64,
+                inv.manufacturer, inv.model, inv.system_type, serial, inv.bios_version, inv.bios_date,
+                inv.os_name, inv.os_version, inv.os_build, inv.os_arch, inv.os_install_date, inv.last_boot,
+                inv.last_user, inv.cpu, inv.cpu_count, inv.cores, inv.logical_processors, inv.memory_mb(),
+                inv.min_free_pct(), serde_json::to_string(&inv.disks)?, serde_json::to_string(&inv.nics)?,
+            ],
+        )?;
+        // Fill blanks only — IT-entered values win.
+        for (col, val) in [("manufacturer", inv.manufacturer.clone()), ("model", inv.model.clone()), ("serial_number", serial)] {
+            if let Some(v) = val.filter(|v| !v.trim().is_empty()) {
+                tx.execute(&format!("UPDATE assets SET {col}=?1 WHERE id=?2 AND ({col} IS NULL OR {col}='')"), params![v.trim(), asset_id])?;
+            }
+        }
+        let dtype = format!(
+            "{}{}",
+            if inv.is_server() { "Windows Server" } else { "Windows Workstation" },
+            if inv.is_virtual() { " (VM)" } else { "" }
+        );
+        tx.execute(
+            "UPDATE assets SET os_guess=COALESCE(?1, os_guess), device_type=?2, inventory_status='ok', inventory_error=NULL, \
+               inventory_at=?3, inventory_credential_id=?4 WHERE id=?5",
+            params![inv.os_name, dtype, ts, credential_id, asset_id],
+        )?;
+        if let Some(cid) = credential_id {
+            tx.execute("UPDATE credentials SET last_success=?1 WHERE id=?2", params![ts, cid])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The stored inventory for an asset as JSON (disks/nics parsed).
+    pub fn windows_inventory(&self, asset_id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.lock();
+        let mut st = conn.prepare("SELECT * FROM windows_inventory WHERE asset_id=?1")?;
+        let cols: Vec<String> = st.column_names().map(|c| c.to_string()).collect();
+        let row = st
+            .query_row([asset_id], |r| {
+                let mut m = serde_json::Map::new();
+                for (i, c) in cols.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                        rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                        rusqlite::types::ValueRef::Text(t) => {
+                            let s = String::from_utf8_lossy(t).into_owned();
+                            if c == "disks" || c == "nics" {
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+                            } else {
+                                serde_json::Value::String(s)
+                            }
+                        }
+                        rusqlite::types::ValueRef::Blob(_) => serde_json::Value::Null,
+                    };
+                    m.insert(c.clone(), v);
+                }
+                Ok(serde_json::Value::Object(m))
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Assets whose last inventory attempt failed ("scanning issues").
+    pub fn inventory_issues(&self, limit: i64) -> Result<Vec<InventoryIssue>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT a.id, {NAME_SQL}, a.ip, (SELECT s.name FROM sites s WHERE s.id=a.site_id), a.inventory_at, a.inventory_error \
+             FROM assets a WHERE a.inventory_status='error' ORDER BY a.inventory_at DESC LIMIT ?1"
+        ))?;
+        let rows = st.query_map([limit], |r| {
+            Ok(InventoryIssue { asset_id: r.get(0)?, name: r.get(1)?, ip: r.get(2)?, site: r.get(3)?, at: r.get(4)?, error: r.get(5)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
