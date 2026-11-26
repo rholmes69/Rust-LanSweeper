@@ -270,3 +270,24 @@ async fn software_and_service_queries() {
     assert_eq!(db.software_summary(Some("zip"), 10).unwrap()[0].0, "7-Zip");
     assert_eq!(db.software_installs("TeamViewer").unwrap().len(), 1);
 }
+
+/// Real-world Windows PowerShell 5.1 shape: arrays returned from a function come out as
+/// {"value":[...],"Count":n}; others as plain arrays or a bare object.
+#[test]
+fn parses_ps51_wrapped_arrays() {
+    let out = r#"{"ok":true,"computer_name":"DESKTOP-NA2MHCN","os_name":"Microsoft Windows 11 Pro",
+"disks":{"value":[{"drive":"C:","filesystem":"NTFS","size_bytes":1000,"free_bytes":500}],"Count":1},
+"nics":[{"description":"Wi-Fi","mac":"AA:BB:CC:DD:EE:FF","ips":{"value":["192.168.4.25"],"Count":1}}],
+"software":{"value":[{"name":"Git","version":"2.47.0","publisher":"The Git Development Community","install_date":"20241101","arch":"x64"},
+                     {"name":"Rust (MSVC 64-bit)","version":"1.82.0","publisher":"Rust Foundation","install_date":null,"arch":"x64"}],"Count":2},
+"software_error":null,
+"services":{"value":[{"name":"Spooler","display_name":"Print Spooler","state":"Running","start_mode":"Auto","start_name":"LocalSystem","path":"C:\\Windows\\System32\\spoolsv.exe"}],"Count":1},
+"services_error":null}"#;
+    let inv = parse_output(out).unwrap();
+    assert_eq!(inv.software.len(), 2);
+    assert_eq!(inv.services.len(), 1);
+    assert_eq!(inv.disks.len(), 1);
+    assert_eq!(inv.disks[0].drive.as_deref(), Some("C:"));
+    assert_eq!(inv.nics[0].ips, vec!["192.168.4.25"]);
+    assert!(COLLECT_PS.contains("Remove-TypeData System.Array"));
+}

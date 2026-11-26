@@ -221,7 +221,8 @@ impl WinInventory {
     }
 }
 
-/// PowerShell 5.1's ConvertTo-Json renders single-element arrays inconsistently; accept both.
+/// PowerShell 5.1's ConvertTo-Json renders arrays inconsistently: a plain array, a bare object
+/// (single element), or `{"value":[...],"Count":n}` (arrays carrying ETS properties). Accept all.
 fn one_or_many<'de, D, T>(d: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -231,11 +232,15 @@ where
     #[serde(untagged)]
     enum OneOrMany<T> {
         Many(Vec<T>),
+        // Must come before One: an all-optional struct would otherwise "match" the wrapper object.
+        Wrapped {
+            value: Vec<T>,
+        },
         One(T),
         None,
     }
     Ok(match Option::<OneOrMany<T>>::deserialize(d)? {
-        Some(OneOrMany::Many(v)) => v,
+        Some(OneOrMany::Many(v)) | Some(OneOrMany::Wrapped { value: v }) => v,
         Some(OneOrMany::One(t)) => vec![t],
         _ => vec![],
     })
@@ -344,7 +349,18 @@ pub async fn collect(target: &str, cred: Option<&Credential>, protocol: &str) ->
     }
     let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     match run_powershell(COLLECT_PS, &env_ref, COLLECT_TIMEOUT).await {
-        Ok(out) => parse_output(&out),
+        Ok(out) => match parse_output(&out) {
+            // Keep the raw collector output (no secrets in it) so format problems can be diagnosed.
+            Err(CollectError::Other(m)) if m.contains("collector") => {
+                let safe: String = target.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+                let path = std::env::temp_dir().join(format!("rustsweeper-collector-{safe}.json"));
+                match std::fs::write(&path, &out) {
+                    Ok(()) => Err(CollectError::Other(format!("{m} (raw output saved to {})", path.display()))),
+                    Err(_) => Err(CollectError::Other(m)),
+                }
+            }
+            other => other,
+        },
         Err(e) if e.to_string().contains("timed out") => Err(CollectError::Unreachable(e.to_string())),
         Err(e) => Err(CollectError::Other(format!("{e:#}"))),
     }
