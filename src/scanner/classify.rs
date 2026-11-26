@@ -115,7 +115,23 @@ pub fn classify(h: &HostResult) -> (Option<String>, Option<String>) {
     } else if os.as_deref().is_some_and(|o| o.contains("macOS")) {
         dtype = Some("Apple Device".into());
     } else if os.as_deref().is_some_and(|o| o.contains("Linux") || o.contains("BSD") || o.contains("Unix")) {
-        dtype = Some(if vendor.contains("raspberry") { "Raspberry Pi".into() } else { "Linux/Unix Server".into() });
+        // A TTL of 64 only says "not Windows": phones, TVs, printers and IoT gear look the same.
+        // Only call it a server when there's real evidence (SSH banner, SNMP, or server ports).
+        let ttl_only = os.as_deref().is_some_and(|o| o.ends_with("(TTL)"));
+        let server_ports = [22, 25, 53, 389, 1433, 3306, 5432, 8443].iter().any(|p| has(*p));
+        dtype = Some(if vendor.contains("raspberry") {
+            "Raspberry Pi".into()
+        } else if !ttl_only || server_ports {
+            "Linux/Unix Server".into()
+        } else if vendor.contains("private/randomized") {
+            "Mobile Device".into()
+        } else if ports.is_empty() {
+            "Unidentified Device".into()
+        } else if has(80) || has(443) || has(8080) {
+            "Web Device".into()
+        } else {
+            "Linux/Unix-based Device".into()
+        });
     } else if has(80) || has(443) || has(8080) {
         dtype = Some("Web Device".into());
     }
@@ -157,5 +173,23 @@ mod tests {
         h.ssh_banner = Some("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13".into());
         h.vendor = Some("VMware".into());
         assert_eq!(classify(&h), (Some("Linux/Unix Server (VM)".into()), Some("Linux (Ubuntu)".into())));
+    }
+
+    #[test]
+    fn ttl_only_devices_are_not_servers() {
+        let mut h = host(&[]);
+        h.ttl = Some(64);
+        assert_eq!(classify(&h), (Some("Unidentified Device".into()), Some("Linux/Unix (TTL)".into())));
+        h.vendor = Some("Private/randomized MAC".into());
+        assert_eq!(classify(&h).0.as_deref(), Some("Mobile Device"));
+        let mut h = host(&[80]);
+        h.ttl = Some(64);
+        assert_eq!(classify(&h).0.as_deref(), Some("Web Device"));
+        let mut h = host(&[22]);
+        h.ttl = Some(64);
+        assert_eq!(classify(&h).0.as_deref(), Some("Linux/Unix Server"));
+        let mut h = host(&[7000]);
+        h.ttl = Some(64);
+        assert_eq!(classify(&h).0.as_deref(), Some("Linux/Unix-based Device"));
     }
 }

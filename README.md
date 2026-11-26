@@ -39,6 +39,8 @@ Medical (HL7 2575 / DICOM 104), Apple Device, Raspberry Pi, and virtual machines
   logged-on user, **installed software** and **Windows services**; stored credentials are
   DPAPI-encrypted; failures are listed as inventory problems
 - **Software** page: every product across the fleet with device and version counts
+- **Security posture** for Windows devices — antivirus/Defender, BitLocker, firewall, last
+  installed update, pending restart — summarised on the dashboard
 - **Scheduled scans** (hourly / daily / weekly …) that run while the server is up
 - **REST API** for scripting and integrations
 - Optional **HTTP basic auth**; listens on localhost only by default
@@ -100,6 +102,15 @@ unquoted executable paths and services running under user accounts. Installs, re
 new/removed services and start-mode changes go into the asset's history. AI assistants get the
 `software` and `services` datasets plus catalog queries such as *remote-access tools installed*,
 *end-of-life software*, *automatic services that aren't running* and *unquoted service paths*.
+
+**Security posture and patches.** Each inventory also records antivirus status (Security Center,
+or Microsoft Defender on servers), Defender signature age, BitLocker protection of C:, Windows
+Firewall profiles, installed updates (KB numbers, with the most recent date), whether a restart is
+pending, and the exact release/build (e.g. 24H2 / 26100.2314). The dashboard counts devices failing
+each check; changes in antivirus, BitLocker or firewall state are logged. AI assistants get a
+`hotfixes` dataset and queries such as *BitLocker off*, *no working antivirus*, *no update in 45+
+days*, *restart pending* and *Windows builds in use*. Checks that need features a device doesn't
+have (e.g. BitLocker on Windows Home, Security Center on Server) show as unknown rather than failing.
 
 **Credentials.** Use an account that is a local administrator on your PCs — usually a dedicated
 domain account (e.g. `DELTA\svc-rustsweeper`) added to local Administrators by Group Policy. Add it
@@ -289,8 +300,10 @@ nssm start RustSweeper
 - Per-scan limit is 65,536 addresses (a /16).
 - Basic auth sends credentials in clear text; put it behind HTTPS (IIS/nginx reverse proxy)
   if it's reachable beyond the IT VLAN.
-- Credentialed inventory covers Windows hardware, OS, user, software and services; patches,
-  antivirus/BitLocker status and Linux (SSH) come next. Credentialed inventory (installed software,
+- Credentialed inventory covers Windows hardware, OS, user, software, services, security posture
+  and installed updates; Linux (SSH) comes next.
+- Devices identified only by their ping TTL are labelled conservatively (Unidentified/Mobile/
+  Linux-based device) — a TTL of 64 alone doesn't mean "server". Credentialed inventory (installed software,
   hardware specs via WMI/WinRM, SSH) or an endpoint agent are natural next steps.
 
 ## Project layout

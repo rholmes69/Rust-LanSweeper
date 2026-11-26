@@ -187,7 +187,7 @@ impl McpServer {
             json!({
                 "name": "search_datasets",
                 "title": "Search datasets and fields",
-                "description": "Discover queryable datasets (assets, ports, changes, custom_fields, software, services, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
+                "description": "Discover queryable datasets (assets, ports, changes, custom_fields, software, services, hotfixes, scans), their fields, operators and limits. Optionally filter by keyword (e.g. 'snmp', 'port', 'time').",
                 "inputSchema": { "type": "object", "properties": { "keyword": { "type": "string" } } },
                 "annotations": ro,
             }),
@@ -486,7 +486,8 @@ When RustSweeper runs on Windows with credentials, it also logs in to Windows de
 hardware (manufacturer, model, serial, BIOS, CPU, RAM, disks), OS edition/build, install date, last boot and the \
 logged-on user (fields os, os_build, last_user, memory_mb, min_disk_free_pct, last_boot, inventory_status…), \
 plus installed programs ('software' dataset, from the registry Uninstall keys) and Windows services ('services' \
-dataset, with unquoted-path and custom-account flags). Patches/hotfixes are not collected yet.";
+dataset, with unquoted-path and custom-account flags), security posture (av_ok, bitlocker_os, firewall_off, \
+reboot_pending, last_patch_date, full_build) and installed updates ('hotfixes' dataset).";
 
 fn docs(q: Option<&str>) -> Value {
     let mut sections: Vec<(String, String)> = vec![("How RustSweeper collects data".into(), DATA_MODEL_DOC.into())];

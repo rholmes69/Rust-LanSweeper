@@ -190,6 +190,14 @@ CREATE TABLE IF NOT EXISTS services (
     PRIMARY KEY (asset_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS hotfixes (
+    asset_id      INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    hotfix_id     TEXT NOT NULL,
+    description   TEXT,
+    installed_on  TEXT,
+    PRIMARY KEY (asset_id, hotfix_id)
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -525,6 +533,21 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("windows_inventory", "software_count", "INTEGER"),
     ("windows_inventory", "software_error", "TEXT"),
     ("windows_inventory", "services_error", "TEXT"),
+    // Phase 3c: security posture
+    ("windows_inventory", "av_products", "TEXT"),
+    ("windows_inventory", "av_ok", "INTEGER"),
+    ("windows_inventory", "defender_realtime", "INTEGER"),
+    ("windows_inventory", "defender_sig_updated", "TEXT"),
+    ("windows_inventory", "bitlocker", "TEXT"),
+    ("windows_inventory", "bitlocker_os", "INTEGER"),
+    ("windows_inventory", "firewall", "TEXT"),
+    ("windows_inventory", "firewall_off", "INTEGER"),
+    ("windows_inventory", "reboot_pending", "INTEGER"),
+    ("windows_inventory", "last_patch_date", "TEXT"),
+    ("windows_inventory", "hotfix_count", "INTEGER"),
+    ("windows_inventory", "display_version", "TEXT"),
+    ("windows_inventory", "ubr", "INTEGER"),
+    ("windows_inventory", "protection_errors", "TEXT"),
 ];
 
 /// SQL expression for an asset's display name (alias `a`). Keep in sync with `Asset::display_name`.
@@ -1370,6 +1393,11 @@ impl Db {
             )
             .optional()?;
         let serial = inv.real_serial();
+        let old_posture: Option<(Option<i64>, Option<i64>, Option<i64>)> = tx
+            .query_row("SELECT av_ok, bitlocker_os, firewall_off FROM windows_inventory WHERE asset_id=?1", [asset_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
         if let Some((os, build, mem, cpu, sn)) = &old {
             let pairs: [(&str, Option<String>, Option<String>); 5] = [
                 ("windows: os", os.clone(), inv.os_name.clone()),
@@ -1476,6 +1504,55 @@ impl Db {
             "UPDATE windows_inventory SET software_count = (SELECT COUNT(*) FROM software WHERE asset_id=?1), software_error=?2, services_error=?3 WHERE asset_id=?1",
             params![asset_id, inv.software_error, inv.services_error],
         )?;
+        // Security posture.
+        if let Some(p) = &inv.protection {
+            let b = |x: Option<bool>| x.map(|v| v as i64);
+            let av_list = p.antivirus.as_ref().map(|list| {
+                serde_json::to_string(&list.iter().map(|a| serde_json::json!({
+                    "name": a.name, "enabled": a.enabled(), "up_to_date": a.up_to_date()
+                })).collect::<Vec<_>>()).unwrap_or_default()
+            });
+            tx.execute(
+                "UPDATE windows_inventory SET av_products=?2, av_ok=?3, defender_realtime=?4, defender_sig_updated=?5, bitlocker=?6, \
+                   bitlocker_os=?7, firewall=?8, firewall_off=?9, reboot_pending=?10, last_patch_date=?11, hotfix_count=?12, \
+                   display_version=?13, ubr=?14, protection_errors=?15 WHERE asset_id=?1",
+                rusqlite::params![
+                    asset_id, av_list, b(p.av_ok()), p.defender.as_ref().map(|d| d.realtime_enabled as i64),
+                    p.defender.as_ref().and_then(|d| d.signature_updated.clone()),
+                    p.bitlocker.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()), b(p.bitlocker_os()),
+                    p.firewall.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default()), b(p.firewall_off()),
+                    b(p.reboot_pending), p.last_patch_date(), p.hotfixes.as_ref().map(|h| h.len() as i64),
+                    p.display_version, p.ubr, (!p.errors.is_empty()).then(|| p.errors.join(" | ")),
+                ],
+            )?;
+            if let Some(hfs) = &p.hotfixes {
+                tx.execute("DELETE FROM hotfixes WHERE asset_id=?1", [asset_id])?;
+                for h in hfs.iter().filter(|h| h.id.as_deref().is_some_and(|i| !i.trim().is_empty())) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO hotfixes (asset_id, hotfix_id, description, installed_on) VALUES (?1,?2,?3,?4)",
+                        params![asset_id, h.id.as_deref().map(str::trim), h.description, h.date_iso()],
+                    )?;
+                }
+            }
+            // Log posture changes (only when both old and new values are known).
+            if let Some((av, bl, fw)) = old_posture {
+                let label = |field: &str, v: i64| match (field, v) {
+                    ("av", 1) => "protected", ("av", _) => "NOT protected",
+                    ("bitlocker", 1) => "on", ("bitlocker", _) => "off",
+                    ("firewall", 1) => "a profile is off", (_, _) => "all profiles on",
+                };
+                for (field, o, n) in [("av", av, b(p.av_ok())), ("bitlocker", bl, b(p.bitlocker_os())), ("firewall", fw, b(p.firewall_off()))] {
+                    if let (Some(o), Some(n)) = (o, n) {
+                        if o != n {
+                            tx.execute(
+                                "INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,?3,?4,?5)",
+                                params![asset_id, ts, format!("windows: {field}"), label(field, o), label(field, n)],
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
         // Fill blanks only — IT-entered values win.
         for (col, val) in [("manufacturer", inv.manufacturer.clone()), ("model", inv.model.clone()), ("serial_number", serial)] {
             if let Some(v) = val.filter(|v| !v.trim().is_empty()) {
@@ -1575,6 +1652,38 @@ impl Db {
         ))?;
         let rows = st.query_map([product], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Security posture checks: (key, label, SQL condition on windows_inventory w).
+    pub const POSTURE_CHECKS: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("no-av", "No working antivirus", "w.av_ok = 0"),
+        ("bitlocker-off", "BitLocker off (C:)", "w.bitlocker_os = 0"),
+        ("not-patched", "No update in 45+ days", "w.last_patch_date < date('now','-45 day')"),
+        ("reboot-pending", "Restart pending", "w.reboot_pending = 1"),
+        ("firewall-off", "Firewall profile off", "w.firewall_off = 1"),
+    ];
+
+    /// (key, label, failing devices, devices with data) for each posture check.
+    pub fn posture_counts(&self) -> Result<Vec<(&'static str, &'static str, i64, i64)>> {
+        let conn = self.lock();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM windows_inventory", [], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for (key, label, cond) in Self::POSTURE_CHECKS {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM windows_inventory w WHERE {cond}"), [], |r| r.get(0))?;
+            out.push((*key, *label, n, total));
+        }
+        Ok(out)
+    }
+
+    /// Assets failing one posture check.
+    pub fn posture_assets(&self, key: &str) -> Result<Option<(&'static str, Vec<Asset>)>> {
+        let Some((_, label, cond)) = Self::POSTURE_CHECKS.iter().find(|(k, _, _)| *k == key) else { return Ok(None) };
+        let conn = self.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT {ASSET_COLS} FROM assets a JOIN windows_inventory w ON w.asset_id = a.id WHERE {cond} ORDER BY a.ip_num"
+        ))?;
+        let rows = st.query_map([], asset_from_row)?;
+        Ok(Some((label, rows.collect::<rusqlite::Result<Vec<_>>>()?)))
     }
 
     /// Assets whose last inventory attempt failed ("scanning issues").

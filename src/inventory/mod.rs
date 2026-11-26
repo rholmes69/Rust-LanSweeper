@@ -150,6 +150,134 @@ impl Service {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AvProduct {
+    pub name: Option<String>,
+    pub product_state: Option<i64>,
+}
+
+impl AvProduct {
+    /// Decode Security Center's productState: middle byte 0x10/0x11 = on, low byte 0x00 = definitions up to date.
+    pub fn enabled(&self) -> Option<bool> {
+        self.product_state.map(|s| matches!((s >> 8) & 0xFF, 0x10 | 0x11))
+    }
+    pub fn up_to_date(&self) -> Option<bool> {
+        self.product_state.map(|s| s & 0xFF == 0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Defender {
+    #[serde(default)]
+    pub antivirus_enabled: bool,
+    #[serde(default)]
+    pub realtime_enabled: bool,
+    pub signature_updated: Option<String>,
+    pub signature_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BitLockerVolume {
+    pub drive: Option<String>,
+    /// 0 = off, 1 = on, 2 = unknown (Win32_EncryptableVolume.ProtectionStatus).
+    pub protection_status: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Hotfix {
+    pub id: Option<String>,
+    pub description: Option<String>,
+    pub installed_on: Option<String>,
+}
+
+impl Hotfix {
+    /// InstalledOn comes back as YYYY-MM-DD, M/D/YYYY (string form) or, rarely, garbage.
+    pub fn date_iso(&self) -> Option<String> {
+        let d = self.installed_on.as_deref()?.trim();
+        for f in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y%m%d"] {
+            if let Ok(x) = chrono::NaiveDate::parse_from_str(d, f) {
+                return Some(x.format("%Y-%m-%d").to_string());
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Firewall {
+    pub domain: Option<i64>,
+    pub private: Option<i64>,
+    pub public: Option<i64>,
+}
+
+/// Security posture collected alongside the inventory. `None` lists mean "couldn't read".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Protection {
+    #[serde(default, deserialize_with = "opt_one_or_many")]
+    pub antivirus: Option<Vec<AvProduct>>,
+    pub defender: Option<Defender>,
+    #[serde(default, deserialize_with = "opt_one_or_many")]
+    pub bitlocker: Option<Vec<BitLockerVolume>>,
+    #[serde(default, deserialize_with = "opt_one_or_many")]
+    pub hotfixes: Option<Vec<Hotfix>>,
+    pub reboot_pending: Option<bool>,
+    pub firewall: Option<Firewall>,
+    pub display_version: Option<String>,
+    pub ubr: Option<i64>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub errors: Vec<String>,
+}
+
+impl Protection {
+    /// Is the device protected by an enabled, up-to-date antivirus? None = couldn't tell.
+    pub fn av_ok(&self) -> Option<bool> {
+        let sc = self.antivirus.as_ref().map(|list| list.iter().any(|a| a.enabled() == Some(true) && a.up_to_date() == Some(true)));
+        let def = self.defender.as_ref().map(|d| d.antivirus_enabled && d.realtime_enabled);
+        match (sc, def) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (None, None) => None,
+            _ => Some(false),
+        }
+    }
+
+    /// BitLocker protection on the system drive (C:).
+    pub fn bitlocker_os(&self) -> Option<bool> {
+        let vols = self.bitlocker.as_ref()?;
+        let c = vols.iter().find(|v| v.drive.as_deref().is_some_and(|d| d.eq_ignore_ascii_case("C:")))?;
+        match c.protection_status {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Any firewall profile switched off?
+    pub fn firewall_off(&self) -> Option<bool> {
+        let f = self.firewall.as_ref()?;
+        let v = [f.domain, f.private, f.public];
+        if v.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(v.iter().any(|x| *x == Some(0)))
+    }
+
+    pub fn last_patch_date(&self) -> Option<String> {
+        self.hotfixes.as_ref()?.iter().filter_map(Hotfix::date_iso).max()
+    }
+}
+
+fn opt_one_or_many<'de, D, T>(d: D) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => one_or_many(v).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 /// What `collect.ps1` returns on success.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct WinInventory {
@@ -185,6 +313,7 @@ pub struct WinInventory {
     #[serde(default, deserialize_with = "one_or_many")]
     pub services: Vec<Service>,
     pub services_error: Option<String>,
+    pub protection: Option<Protection>,
 }
 
 impl WinInventory {
@@ -307,8 +436,20 @@ pub fn parse_output(stdout: &str) -> std::result::Result<WinInventory, CollectEr
     serde_json::from_value(v).map_err(|e| CollectError::Other(format!("unexpected collector output: {e}")))
 }
 
+/// Strip full-line comments and indentation so the encoded script stays well inside Windows'
+/// 32,767-character command-line limit. (The script has no here-strings, so this is safe.)
+pub fn minify(script: &str) -> String {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `powershell -EncodedCommand` takes base64 of UTF-16LE.
 pub fn encode_command(script: &str) -> String {
+    let script = minify(script);
     let bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
