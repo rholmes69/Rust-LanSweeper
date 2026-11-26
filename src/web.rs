@@ -78,7 +78,12 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/assets", get(assets_page))
         .route("/assets/{id}", get(asset_page))
-        .route("/assets/{id}/notes", post(save_notes))
+        .route("/assets/{id}/details", post(save_details))
+        .route("/assets/new", get(new_asset_page).post(create_asset))
+        .route("/import", get(import_page).post(import_upload))
+        .route("/custom-fields", get(custom_fields_page).post(add_custom_field))
+        .route("/custom-fields/{id}/delete", post(delete_custom_field))
+        .route("/api/import", post(api_import))
         .route("/assets/{id}/delete", post(delete_asset))
         .route("/assets/{id}/site", post(set_asset_site))
         .route("/sites", get(sites_page).post(add_site))
@@ -95,8 +100,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ai-access", get(ai_access_page))
         .route("/export.csv", get(export_csv))
         .route("/api/stats", get(api_stats))
-        .route("/api/assets", get(api_assets))
-        .route("/api/assets/{id}", get(api_asset))
+        .route("/api/assets", get(api_assets).post(api_create_asset))
+        .route("/api/assets/{id}", get(api_asset).patch(api_update_asset))
         .route("/api/scans", get(api_scans).post(api_start_scan))
         .route("/api/scans/{id}", get(api_scan))
         .route("/api/query", post(api_query))
@@ -183,6 +188,7 @@ fn status_pill(s: &str) -> String {
     let cls = match s {
         "online" | "completed" => "ok",
         "offline" | "failed" | "interrupted" => "bad",
+        "unknown" => "",
         "running" => "run",
         _ => "",
     };
@@ -458,6 +464,8 @@ async fn assets_page(State(st): State<AppState>, Query(q): Query<AssetQuery>) ->
         .collect();
     let body = format!(
         "<div class=row><h1>Assets <span class=muted style='font-weight:400'>({})</span></h1><div class=spacer></div>\
+         <a class=btn href='/assets/new' style='background:#fff;color:var(--ink);border:1px solid var(--line)'>Add asset</a>&nbsp;\
+         <a class=btn href='/import' style='background:#fff;color:var(--ink);border:1px solid var(--line)'>Import CSV</a>&nbsp;\
          <a class=btn href='/export.csv?{base}'>Export CSV</a></div>\
          <div class=card><form class=row action=/assets>\
            <input type=text name=q value='{}' placeholder='Search…' style='flex:1;min-width:220px'>\
@@ -509,7 +517,8 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
            <div class=card><h2>Web</h2><dl>{web}</dl></div>\
            <div class=card><h2>Site</h2><form method=post action='/assets/{id}/site' class=row><select name=site_id>{site_opts}</select><button class=ghost>Set</button></form>\
              <div class=hint>&ldquo;Automatic&rdquo; places the asset by its IP and your site subnets.</div></div>\
-           <div class=card><h2>Notes</h2><form method=post action='/assets/{id}/notes'><textarea name=notes placeholder='Owner, location, asset tag, warranty…'>{notes}</textarea><div style='margin-top:8px'><button>Save notes</button></div></form></div>\
+           <div class=card><h2>Asset details</h2><form method=post action='/assets/{id}/details'>{details_form}\
+             <div style='margin-top:10px' class=row><button>Save details</button><span class=hint><a href=/custom-fields>Manage custom fields</a></span></div></form></div>\
           </div>\
          </div>",
         name = esc(&a.display_name()),
@@ -530,6 +539,8 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
             row("OS (guess)", opt(&a.os_guess)),
             row("TTL", a.ttl.map(|t| t.to_string()).unwrap_or_else(|| "—".into())),
             row("SSH banner", format!("<span class=mono>{}</span>", opt(&a.ssh_banner))),
+            row("Source", format!("{}{}", esc(&a.source), if a.scan_count > 0 { format!(" <span class=muted>· seen by {} scan(s)</span>", a.scan_count) } else { String::new() })),
+            row("Detected via", opt(&a.detected_by)),
             row("First seen", esc(&a.first_seen)),
             row("Last seen", esc(&a.last_seen)),
         ]
@@ -545,7 +556,7 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
         ]
         .concat(),
         web = [row("Server", opt(&a.http_server)), row("Title", opt(&a.http_title))].concat(),
-        notes = esc(&a.notes),
+        details_form = details_form(&a, &st.db.custom_fields()?, &st.db.asset_custom_values(a.id)?),
         site_opts = std::iter::once(format!("<option value=''{}>Automatic (by subnet)</option>", if a.site_manual { "" } else { " selected" }))
             .chain(st.db.list_sites()?.iter().map(|x| format!(
                 "<option value='{}'{}>{}</option>", x.id,
@@ -555,14 +566,218 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
     Ok(page(&a.display_name(), "assets", body).into_response())
 }
 
-#[derive(Deserialize)]
-struct NotesForm {
-    notes: String,
+fn details_form(a: &Asset, custom: &[crate::db::CustomField], values: &[(String, String)]) -> String {
+    let input = |name: &str, label: &str, value: &str, kind: &str| {
+        format!(
+            "<label style='display:block'><span class=muted style='font-size:12px'>{label}</span><br>\
+             <input type={kind} name='{name}' value='{}' style='width:100%'></label>",
+            esc(value)
+        )
+    };
+    let mut html = String::from("<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px 10px'>");
+    for (col, label) in crate::db::EDITABLE_FIELDS.iter().filter(|(c, _)| *c != "notes") {
+        let kind = if crate::db::DATE_FIELDS.contains(col) { "date" } else { "text" };
+        html.push_str(&input(col, label, a.editable(col).as_deref().unwrap_or(""), kind));
+    }
+    for f in custom {
+        let v = values.iter().find(|(k, _)| k == &f.name).map(|(_, v)| v.as_str()).unwrap_or("");
+        html.push_str(&input(&format!("custom:{}", f.name), &esc(&f.name), v, "text"));
+    }
+    html.push_str("</div>");
+    html.push_str(&format!(
+        "<label style='display:block;margin-top:8px'><span class=muted style='font-size:12px'>Notes</span>\
+         <textarea name=notes>{}</textarea></label>",
+        esc(&a.notes)
+    ));
+    html
 }
 
-async fn save_notes(State(st): State<AppState>, Path(id): Path<i64>, Form(f): Form<NotesForm>) -> WebResult<Redirect> {
-    st.db.set_notes(id, &f.notes)?;
-    Ok(Redirect::to(&format!("/assets/{id}")))
+/// Split a submitted details form into built-in field edits and custom field edits.
+fn parse_details(form: &HashMap<String, String>) -> Result<(Vec<(String, Option<String>)>, Vec<(String, Option<String>)>)> {
+    let mut edits = Vec::new();
+    let mut custom = Vec::new();
+    for (k, v) in form {
+        if let Some(name) = k.strip_prefix("custom:") {
+            custom.push((name.to_string(), Some(v.trim().to_string()).filter(|s| !s.is_empty())));
+        } else if crate::db::EDITABLE_FIELDS.iter().any(|(c, _)| c == k) {
+            let v = crate::db::normalize_field(k, v).map_err(|e| anyhow::anyhow!("{k}: {e}"))?;
+            edits.push((k.clone(), v));
+        }
+    }
+    Ok((edits, custom))
+}
+
+async fn save_details(State(st): State<AppState>, Path(id): Path<i64>, Form(form): Form<HashMap<String, String>>) -> WebResult<Response> {
+    let (edits, custom) = match parse_details(&form) {
+        Ok(x) => x,
+        Err(e) => return Ok(form_error("Could not save", "assets", &e, &format!("/assets/{id}"))),
+    };
+    st.db.update_asset_fields(id, &edits)?;
+    for (name, v) in custom {
+        st.db.set_custom_value(id, &name, v.as_deref())?;
+    }
+    Ok(Redirect::to(&format!("/assets/{id}")).into_response())
+}
+
+async fn new_asset_page() -> Html<String> {
+    page("Add asset", "assets", "<h1>Add asset</h1><div class=card>\
+        <p class=muted>For devices the scanner can't reach (off-network laptops, spare stock, peripherals). If the scanner later finds a device with the same MAC or IP, it updates this record instead of creating a new one.</p>\
+        <form method=post action=/assets/new class=row>\
+          <input type=text name=name placeholder='Name (e.g. LAPTOP-0142)' style='min-width:220px'>\
+          <input type=text name=ip placeholder='IP (optional)'>\
+          <input type=text name=mac placeholder='MAC (optional)'>\
+          <button>Add</button></form><div class=hint>Give at least one of name, IP or MAC. You can fill in owner, serial, warranty and other details on the next page.</div></div>".into())
+}
+
+#[derive(Deserialize)]
+struct NewAssetForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    mac: String,
+}
+
+async fn create_asset(State(st): State<AppState>, Form(f): Form<NewAssetForm>) -> WebResult<Response> {
+    let opt_s = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    Ok(match st.db.create_manual_asset(opt_s(&f.ip).as_deref(), opt_s(&f.mac).as_deref(), opt_s(&f.name).as_deref(), "manual") {
+        Ok(id) => Redirect::to(&format!("/assets/{id}")).into_response(),
+        Err(e) => form_error("Could not add asset", "assets", &e, "/assets/new"),
+    })
+}
+
+// ---------------------------------------------------------------- import & custom fields
+
+fn import_form() -> String {
+    "<form method=post action=/import enctype=multipart/form-data>\
+       <div class=row style='margin-bottom:8px'><input type=file name=file accept='.csv,text/csv'>\
+       <label><input type=checkbox name=create_missing value=1> Create assets for rows that match nothing</label>\
+       <label><input type=checkbox name=dry_run value=1 checked> Preview only (dry run)</label></div>\
+       <textarea name=text placeholder='…or paste CSV here'></textarea>\
+       <div style='margin-top:8px'><button>Import</button></div></form>".into()
+}
+
+async fn import_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let custom = st.db.custom_fields()?;
+    let cols: Vec<String> = crate::db::EDITABLE_FIELDS.iter().map(|(c, _)| format!("<code>{c}</code>")).collect();
+    Ok(page("Import", "assets", format!(
+        "<h1>Import asset details</h1>\
+         <div class=card>{}</div>\
+         <div class=card><h2>How matching works</h2>\
+         <p>Each row is matched to an existing asset by the first identifier column present: <code>id</code>, <code>asset_tag</code>, \
+         <code>serial_number</code>, <code>mac</code>, <code>ip</code>, <code>name</code>. The easiest workflow is \
+         <a href=/export.csv>export the asset list</a>, fill in columns in Excel, and import it back.</p>\
+         <p>Updatable columns: {}, <code>site</code> (pins the asset; <code>auto</code> to unpin){}.</p>\
+         <p class=hint>Empty cells leave a field unchanged; a cell containing just <code>-</code> clears it. Dates accept YYYY-MM-DD or MM/DD/YYYY. \
+         Other columns (vendor, device_type, …) are ignored. Every change is recorded in the asset's history.</p></div>",
+        import_form(),
+        cols.join(", "),
+        if custom.is_empty() { String::new() } else {
+            format!(", and custom fields: {}", custom.iter().map(|f| format!("<code>{}</code>", esc(&f.name))).collect::<Vec<_>>().join(", "))
+        }
+    )))
+}
+
+fn import_report_html(r: &crate::import::ImportReport) -> String {
+    let rows: String = r
+        .results
+        .iter()
+        .filter(|x| x.action != "unchanged" || !x.errors.is_empty())
+        .take(500)
+        .map(|x| {
+            let pill = match x.action.as_str() {
+                "created" => "<span class='pill ok'>created</span>".to_string(),
+                "updated" => "<span class='pill run'>updated</span>".to_string(),
+                "skipped" => "<span class='pill bad'>skipped</span>".to_string(),
+                other => status_pill(other),
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{pill}</td><td>{}</td><td style='color:var(--bad)'>{}</td></tr>",
+                x.row,
+                match (x.asset_id, &x.asset) {
+                    (Some(id), Some(n)) => format!("<a href='/assets/{id}'>{}</a>", esc(n)),
+                    (_, Some(n)) => esc(n),
+                    _ => "—".into(),
+                },
+                x.changes.iter().map(|c| esc(c)).collect::<Vec<_>>().join("<br>"),
+                x.errors.iter().map(|c| esc(c)).collect::<Vec<_>>().join("<br>")
+            )
+        })
+        .collect();
+    format!(
+        "<div class=card><h2>{}</h2><p>{} rows · {} matched · {} created · {} assets updated ({} field changes) · {} skipped</p>\
+         <p class=hint>Identifier columns: {} · updated: {} · ignored: {}</p>\
+         <table><tr><th>Row</th><th>Asset</th><th>Result</th><th>Changes</th><th>Problems</th></tr>{}</table></div>",
+        if r.dry_run { "Preview — nothing was saved" } else { "Import complete" },
+        r.rows, r.matched, r.created, r.updated_assets, r.fields_changed, r.skipped,
+        esc(&r.key_columns.join(", ")), esc(&r.update_columns.join(", ")),
+        if r.ignored_columns.is_empty() { "none".into() } else { esc(&r.ignored_columns.join(", ")) },
+        if rows.is_empty() { "<tr><td colspan=5 class=muted>No changes</td></tr>".into() } else { rows }
+    )
+}
+
+async fn import_upload(State(st): State<AppState>, mut mp: axum::extract::Multipart) -> WebResult<Response> {
+    let mut data = String::new();
+    let mut opts = crate::import::ImportOptions { source: "import".into(), ..Default::default() };
+    while let Some(field) = mp.next_field().await.map_err(|e| anyhow::anyhow!("upload failed: {e}"))? {
+        let name = field.name().unwrap_or("").to_string();
+        let bytes = field.bytes().await.map_err(|e| anyhow::anyhow!("upload failed: {e}"))?;
+        match name.as_str() {
+            "file" if !bytes.is_empty() => data = String::from_utf8_lossy(&bytes).into_owned(),
+            "text" if data.is_empty() => data = String::from_utf8_lossy(&bytes).into_owned(),
+            "create_missing" => opts.create_missing = true,
+            "dry_run" => opts.dry_run = true,
+            _ => {}
+        }
+    }
+    if data.trim().is_empty() {
+        return Ok(form_error("Nothing to import", "assets", &anyhow::anyhow!("choose a CSV file or paste CSV text"), "/import"));
+    }
+    Ok(match crate::import::import_csv(&st.db, &data, &opts) {
+        Ok(r) => page("Import", "assets", format!(
+            "<h1>Import asset details</h1>{}<div class=card><h2>Import another file</h2>{}</div>",
+            import_report_html(&r), import_form()
+        )).into_response(),
+        Err(e) => form_error("Import failed", "assets", &e, "/import"),
+    })
+}
+
+async fn custom_fields_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let rows: String = st
+        .db
+        .custom_fields()?
+        .iter()
+        .map(|f| format!(
+            "<tr><td>{}</td><td>{}</td><td class=muted>{}</td><td><form class=inline method=post action='/custom-fields/{}/delete' \
+             onsubmit=\"return confirm('Delete this field and its values on every asset?')\"><button class=danger>Delete</button></form></td></tr>",
+            esc(&f.name), f.in_use, esc(&f.created_at), f.id
+        ))
+        .collect();
+    Ok(page("Custom fields", "assets", format!(
+        "<h1>Custom fields</h1><div class=card><h2>Add field</h2><form method=post action=/custom-fields class=row>\
+         <input type=text name=name placeholder='e.g. Room, Insurance Plan, Clinical use' required><button>Add</button></form>\
+         <div class=hint>Custom fields appear on every asset's details form, in CSV export/import, and to AI assistants (custom_fields dataset).</div></div>\
+         <div class=card style='padding:0'><table><tr><th>Field</th><th>Assets with a value</th><th>Created</th><th></th></tr>{}</table></div>",
+        if rows.is_empty() { "<tr><td colspan=4 class=muted>No custom fields yet</td></tr>".into() } else { rows }
+    )))
+}
+
+#[derive(Deserialize)]
+struct CustomFieldForm {
+    name: String,
+}
+
+async fn add_custom_field(State(st): State<AppState>, Form(f): Form<CustomFieldForm>) -> WebResult<Response> {
+    Ok(match st.db.add_custom_field(&f.name) {
+        Ok(_) => Redirect::to("/custom-fields").into_response(),
+        Err(e) => form_error("Could not add field", "assets", &e, "/custom-fields"),
+    })
+}
+
+async fn delete_custom_field(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Redirect> {
+    st.db.delete_custom_field(id)?;
+    Ok(Redirect::to("/custom-fields"))
 }
 
 async fn delete_asset(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Redirect> {
@@ -921,27 +1136,37 @@ fn csv_field(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-pub fn assets_csv(assets: &[Asset]) -> String {
-    let mut out = String::from(
-        "ip,name,site,mac,vendor,dns_name,netbios_name,domain,device_type,os_guess,open_ports,status,snmp_descr,snmp_location,first_seen,last_seen,notes\r\n",
-    );
+/// CSV export. Columns are import-compatible: edit in Excel and import back.
+pub fn assets_csv(db: &Db, assets: &[Asset]) -> Result<String> {
+    let custom_names: Vec<String> = db.custom_fields()?.into_iter().map(|f| f.name).collect();
+    let custom = db.all_custom_values()?;
+    let mut header: Vec<String> = ["id", "ip", "name", "site", "mac", "vendor", "dns_name", "netbios_name", "domain", "device_type",
+        "os_guess", "open_ports", "status", "source", "detected_by", "snmp_descr", "snmp_location", "first_seen", "last_seen"]
+        .iter().map(|s| s.to_string()).collect();
+    header.extend(crate::db::EDITABLE_FIELDS.iter().filter(|(c, _)| *c != "notes").map(|(c, _)| c.to_string()));
+    header.extend(custom_names.iter().map(|n| csv_field(n)));
+    header.push("notes".into());
+    let mut out = header.join(",");
+    out.push_str("\r\n");
     for a in assets {
         let o = |v: &Option<String>| csv_field(v.as_deref().unwrap_or(""));
-        out.push_str(
-            &[
-                csv_field(&a.ip), csv_field(&a.display_name()), o(&a.site), o(&a.mac), o(&a.vendor), o(&a.hostname), o(&a.netbios_name),
-                o(&a.netbios_domain), o(&a.device_type), o(&a.os_guess), a.open_ports.to_string(), csv_field(&a.status),
-                o(&a.snmp_descr), o(&a.snmp_location), csv_field(&a.first_seen), csv_field(&a.last_seen), csv_field(&a.notes),
-            ]
-            .join(","),
-        );
+        let mut row = vec![
+            a.id.to_string(), csv_field(&a.ip), csv_field(&a.display_name()), o(&a.site), o(&a.mac), o(&a.vendor), o(&a.hostname),
+            o(&a.netbios_name), o(&a.netbios_domain), o(&a.device_type), o(&a.os_guess), a.open_ports.to_string(), csv_field(&a.status),
+            csv_field(&a.source), o(&a.detected_by), o(&a.snmp_descr), o(&a.snmp_location), csv_field(&a.first_seen), csv_field(&a.last_seen),
+        ];
+        row.extend(crate::db::EDITABLE_FIELDS.iter().filter(|(c, _)| *c != "notes").map(|(c, _)| o(&a.editable(c))));
+        let mine = custom.get(&a.id);
+        row.extend(custom_names.iter().map(|n| csv_field(mine.and_then(|m| m.get(n)).map(String::as_str).unwrap_or(""))));
+        row.push(csv_field(&a.notes));
+        out.push_str(&row.join(","));
         out.push_str("\r\n");
     }
-    out
+    Ok(out)
 }
 
 async fn export_csv(State(st): State<AppState>, Query(q): Query<AssetQuery>) -> WebResult<Response> {
-    let csv = assets_csv(&st.db.list_assets(&q.filter())?);
+    let csv = assets_csv(&st.db, &st.db.list_assets(&q.filter())?)?;
     Ok((
         [
             (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
@@ -964,7 +1189,83 @@ async fn api_assets(State(st): State<AppState>, Query(q): Query<AssetQuery>) -> 
 
 async fn api_asset(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
     let Some(a) = st.db.get_asset(id)? else { return Ok((StatusCode::NOT_FOUND, Json(json!({"error":"not found"}))).into_response()) };
-    Ok(Json(json!({ "asset": a, "ports": st.db.asset_ports(id)?, "changes": st.db.changes(Some(id), 200)? })).into_response())
+    Ok(Json(json!({
+        "asset": a,
+        "custom_fields": st.db.asset_custom_values(id)?.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        "ports": st.db.asset_ports(id)?,
+        "changes": st.db.changes(Some(id), 200)?,
+    })).into_response())
+}
+
+/// PATCH /api/assets/{id}: {"owner":"Jane","warranty_end":"2027-06-30","custom":{"Room":"12B"},"site":"Dental"|"auto"}
+/// A null or "" value clears a field.
+async fn api_update_asset(State(st): State<AppState>, Path(id): Path<i64>, Json(body): Json<serde_json::Value>) -> WebResult<Response> {
+    let bad = |m: String| Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": m }))).into_response());
+    if st.db.get_asset(id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, Json(json!({"error":"not found"}))).into_response());
+    }
+    let Some(obj) = body.as_object() else { return bad("expected a JSON object".into()) };
+    let mut edits = Vec::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            "custom" | "site" => {}
+            col if crate::db::EDITABLE_FIELDS.iter().any(|(c, _)| *c == col) => {
+                let raw = v.as_str().map(str::to_string).unwrap_or_else(|| if v.is_null() { String::new() } else { v.to_string() });
+                match crate::db::normalize_field(col, &raw) {
+                    Ok(val) => edits.push((col.to_string(), val)),
+                    Err(e) => return bad(format!("{col}: {e}")),
+                }
+            }
+            other => return bad(format!("'{other}' is not editable")),
+        }
+    }
+    let site = match obj.get("site") {
+        None => None,
+        Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) || v.is_null() => Some(None),
+        Some(v) => match crate::query::resolve_site(&st.db, v) {
+            Ok(id) => Some(id),
+            Err(e) => return bad(format!("{e:#}")),
+        },
+    };
+    let changed = st.db.update_asset_fields(id, &edits)?;
+    let mut custom_changed = 0;
+    if let Some(c) = obj.get("custom").and_then(|c| c.as_object()) {
+        for (name, v) in c {
+            if let Err(e) = st.db.set_custom_value(id, name, v.as_str()).map(|ch| custom_changed += ch as usize) {
+                return bad(format!("{e:#}"));
+            }
+        }
+    }
+    if let Some(s) = site {
+        st.db.set_asset_site(id, s)?;
+    }
+    Ok(Json(json!({ "id": id, "fields_changed": changed + custom_changed, "asset": st.db.get_asset(id)? })).into_response())
+}
+
+/// POST /api/assets: {"name":"LAPTOP-0142","ip":null,"mac":"..."} → creates a manual asset.
+async fn api_create_asset(State(st): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+    let g = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    match st.db.create_manual_asset(g("ip").as_deref(), g("mac").as_deref(), g("name").as_deref(), "api") {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{e:#}") }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    #[serde(default)]
+    create_missing: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// POST /api/import?dry_run=true&create_missing=true with a CSV body.
+async fn api_import(State(st): State<AppState>, Query(q): Query<ImportQuery>, body: String) -> Response {
+    let opts = crate::import::ImportOptions { create_missing: q.create_missing, dry_run: q.dry_run, source: "import".into() };
+    match crate::import::import_csv(&st.db, &body, &opts) {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{e:#}") }))).into_response(),
+    }
 }
 
 async fn api_scans(State(st): State<AppState>) -> WebResult<Json<serde_json::Value>> {

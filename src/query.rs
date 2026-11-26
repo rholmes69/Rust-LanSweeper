@@ -51,7 +51,7 @@ macro_rules! f {
     };
 }
 
-const ASSET_NAME: &str = "COALESCE(a.netbios_name, a.hostname, a.snmp_name, a.ip)";
+const ASSET_NAME: &str = crate::db::NAME_SQL;
 const ASSET_SITE: &str = "(SELECT st.name FROM sites st WHERE st.id = a.site_id)";
 
 pub static DATASETS: &[Dataset] = &[
@@ -65,7 +65,7 @@ pub static DATASETS: &[Dataset] = &[
         fields: &[
             f!("id", "a.id", Int, "Asset id"),
             f!("ip", "a.ip", Text, "IPv4 address (sorts numerically)"),
-            f!("name", "COALESCE(a.netbios_name, a.hostname, a.snmp_name, a.ip)", Text, "Best display name: NetBIOS, then DNS, then SNMP sysName, then IP"),
+            f!("name", ASSET_NAME, Text, "Display name: IT-assigned name, then NetBIOS, DNS, SNMP sysName, IP"),
             f!("site", "(SELECT st.name FROM sites st WHERE st.id = a.site_id)", Text, "Site (location) name; empty if unassigned"),
             f!("site_id", "a.site_id", Int, "Site id"),
             f!("mac", "a.mac", Text, "MAC address AA:BB:CC:DD:EE:FF"),
@@ -85,6 +85,21 @@ pub static DATASETS: &[Dataset] = &[
             f!("ssh_banner", "a.ssh_banner", Text, "SSH server banner"),
             f!("status", "a.status", Text, "'online' or 'offline' (as of the last scan covering this IP)"),
             f!("notes", "a.notes", Text, "Free-text notes entered by IT"),
+            f!("asset_tag", "a.asset_tag", Text, "IT asset tag"),
+            f!("serial_number", "a.serial_number", Text, "Serial number"),
+            f!("manufacturer", "a.manufacturer", Text, "Manufacturer (entered/imported; see vendor for the MAC-derived maker)"),
+            f!("model", "a.model", Text, "Model"),
+            f!("owner", "a.owner", Text, "Owner / assigned user"),
+            f!("department", "a.department", Text, "Department"),
+            f!("cost_center", "a.cost_center", Text, "Cost center"),
+            f!("location", "a.location", Text, "Room / physical location (finer than site)"),
+            f!("purchase_date", "a.purchase_date", Time, "Purchase date (YYYY-MM-DD)"),
+            f!("po_number", "a.po_number", Text, "Purchase order number"),
+            f!("supplier", "a.supplier", Text, "Supplier / reseller"),
+            f!("warranty_end", "a.warranty_end", Time, "Warranty end date (YYYY-MM-DD); compare with now+90d etc."),
+            f!("source", "a.source", Text, "Where the record came from: scanner, manual, import, api"),
+            f!("detected_by", "a.detected_by", Text, "How the last scan saw the device: tcp, ping, netbios, snmp, arp"),
+            f!("scan_count", "a.scan_count", Int, "Number of scans that have seen the device"),
             f!("first_seen", "a.first_seen", Time, "When the asset was first discovered"),
             f!("last_seen", "a.last_seen", Time, "When the asset last responded"),
             f!("open_ports", "(SELECT COUNT(*) FROM ports p WHERE p.asset_id = a.id)", Int, "Number of open TCP ports"),
@@ -130,6 +145,22 @@ pub static DATASETS: &[Dataset] = &[
             f!("old_value", "c.old_value", Text, "Previous value"),
             f!("new_value", "c.new_value", Text, "New value"),
             f!("scan_id", "c.scan_id", Int, "Scan that detected the change"),
+        ],
+    },
+    Dataset {
+        name: "custom_fields",
+        description: "Organisation-defined custom field values, one row per asset per field (e.g. 'Insurance Plan', 'Room').",
+        from: "asset_custom_values cv JOIN custom_fields cf ON cf.id = cv.field_id JOIN assets a ON a.id = cv.asset_id",
+        default_fields: &["asset_id", "asset_name", "ip", "field", "value"],
+        default_sort: "cf.name, a.ip_num",
+        site_col: "a.site_id",
+        fields: &[
+            f!("asset_id", "cv.asset_id", Int, "Asset id"),
+            f!("asset_name", ASSET_NAME, Text, "Asset display name"),
+            f!("ip", "a.ip", Text, "Asset IP"),
+            f!("site", ASSET_SITE, Text, "Asset's site name"),
+            f!("field", "cf.name", Text, "Custom field name"),
+            f!("value", "cv.value", Text, "Value"),
         ],
     },
     Dataset {
@@ -273,9 +304,14 @@ fn resolve_time(v: &str) -> Result<String> {
     if s == "now" {
         return Ok(crate::db::now());
     }
-    if let Some(rest) = s.strip_prefix("now-") {
+    let (rest, sign) = match (s.strip_prefix("now-"), s.strip_prefix("now+")) {
+        (Some(r), _) => (Some(r), -1),
+        (_, Some(r)) => (Some(r), 1),
+        _ => (None, 1),
+    };
+    if let Some(rest) = rest {
         let (num, unit) = rest.split_at(rest.len().saturating_sub(1));
-        let n: i64 = num.parse().map_err(|_| anyhow!("bad relative time '{v}' (use e.g. now-7d, now-12h, now-30m)"))?;
+        let n: i64 = num.parse::<i64>().map_err(|_| anyhow!("bad relative time '{v}' (use e.g. now-7d, now+90d, now-12h)"))? * -sign;
         let d = match unit {
             "d" => chrono::Duration::days(n),
             "h" => chrono::Duration::hours(n),
@@ -534,7 +570,7 @@ pub fn describe(keyword: Option<&str>) -> Value {
     json!({
         "datasets": out,
         "operators": ["eq","ne","contains","not_contains","starts_with","gt","gte","lt","lte","in","not_in","is_null","not_null"],
-        "relative_time": "Time fields accept 'now', 'now-30m', 'now-12h', 'now-7d', 'now-4w' or 'YYYY-MM-DD'.",
+        "relative_time": "Time/date fields accept 'now', 'now-30m', 'now-12h', 'now-7d', 'now+90d', 'now-4w' or 'YYYY-MM-DD'.",
         "limits": { "default": MCP_LIMITS.default, "max": MCP_LIMITS.max, "paging": "use offset" },
     })
 }

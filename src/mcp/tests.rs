@@ -256,3 +256,36 @@ async fn site_scoped_tokens_are_enforced() {
     let none = scoped(Some(vec![]));
     assert_eq!(tool_as(&s, &none, "execute_query", json!({"dataset":"assets"})).await["structuredContent"]["total"], 0);
 }
+
+#[tokio::test]
+async fn asset_details_in_queries() {
+    let s = server(false);
+    let db = &s.state.db;
+    let dc = db.list_assets(&crate::db::AssetFilter { q: Some("DC01".into()), ..Default::default() }).unwrap()[0].id;
+    let fd = db.list_assets(&crate::db::AssetFilter { q: Some("FRONTDESK-01".into()), ..Default::default() }).unwrap()[0].id;
+    let soon = (chrono::Local::now() + chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+    db.update_asset_fields(dc, &[("warranty_end".into(), Some(soon)), ("owner".into(), Some("IT".into()))]).unwrap();
+    db.update_asset_fields(fd, &[("warranty_end".into(), Some("2020-01-01".into())), ("department".into(), Some("Front Desk".into()))]).unwrap();
+    db.add_custom_field("Room").unwrap();
+    db.set_custom_value(fd, "room", Some("Lobby")).unwrap();
+
+    let r = tool(&s, "search_query_catalog", json!({"run_id":"warranty-expiring-90d"})).await;
+    assert_eq!(r["result"]["total"], 1);
+    assert_eq!(r["result"]["rows"][0]["name"], "DC01");
+    let r = tool(&s, "search_query_catalog", json!({"run_id":"warranty-expired"})).await;
+    assert_eq!(r["result"]["rows"][0]["name"], "FRONTDESK-01");
+    let r = tool(&s, "search_query_catalog", json!({"run_id":"workstations-without-owner"})).await;
+    assert_eq!(r["result"]["total"], 2);
+    let r = tool(&s, "execute_query", json!({"dataset":"custom_fields","filters":[{"field":"field","op":"eq","value":"Room"}]})).await;
+    assert_eq!(r["rows"][0]["value"], "Lobby");
+    let r = tool(&s, "get_asset", json!({"id": fd})).await;
+    assert_eq!(r["custom_fields"]["Room"], "Lobby");
+    assert_eq!(r["asset"]["department"], "Front Desk");
+
+    // A display-name override is used everywhere.
+    db.update_asset_fields(dc, &[("name_override".into(), Some("Primary DC".into()))]).unwrap();
+    let r = tool(&s, "get_asset", json!({"name":"primary dc"})).await;
+    assert_eq!(r["asset"]["id"], dc);
+    let r = tool(&s, "execute_query", json!({"dataset":"changes","filters":[{"field":"change","op":"eq","value":"name_override"}]})).await;
+    assert_eq!(r["rows"][0]["asset_name"], "Primary DC");
+}
