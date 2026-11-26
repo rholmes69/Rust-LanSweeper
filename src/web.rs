@@ -76,6 +76,8 @@ pub fn launch_scan_for_site(state: &AppState, spec: &str, trigger: &str, site_id
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/favicon.ico", get(favicon))
+        .route("/logo.png", get(logo))
         .route("/assets", get(assets_page))
         .route("/assets/{id}", get(asset_page))
         .route("/assets/{id}/details", post(save_details))
@@ -206,7 +208,7 @@ const CSS: &str = r#"
 *{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 header{background:var(--nav);color:#fff;display:flex;align-items:center;gap:28px;padding:0 24px;height:54px}
-header .brand{font-weight:700;font-size:17px;letter-spacing:.2px}header .brand span{color:#60a5fa}
+header .brand{font-weight:700;font-size:17px;letter-spacing:.2px;display:flex;align-items:center;gap:8px;color:#fff;text-decoration:none}header .brand img{width:30px;height:30px}header .brand span{color:#60a5fa}
 header nav a{color:#cbd5e1;margin-right:18px;font-weight:500}header nav a.active,header nav a:hover{color:#fff;text-decoration:none}
 header form{margin-left:auto}header input{background:#1f2937;border:1px solid #374151;color:#fff;border-radius:6px;padding:6px 10px;width:240px}
 main{max-width:1320px;margin:0 auto;padding:24px}
@@ -245,12 +247,23 @@ fn page_ext(title: &str, active: &str, body: String, head_extra: &str) -> Html<S
         .collect::<String>();
     Html(format!(
         "<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>\
-         <title>{} · RustSweeper</title>{head_extra}<style>{CSS}</style></head><body>\
-         <header><div class=brand>Rust<span>Sweeper</span></div><nav>{nav}</nav>\
+         <title>{} · RustSweeper</title><link rel=icon href=/favicon.ico>{head_extra}<style>{CSS}</style></head><body>\
+         <header><a class=brand href=/><img src=/logo.png alt=''><div>Rust<span>Sweeper</span></div></a><nav>{nav}</nav>\
          <form action=/assets><input type=text name=q placeholder='Search IP, name, MAC, vendor, port…'></form></header>\
          <main>{body}</main></body></html>",
         esc(title)
     ))
+}
+
+const FAVICON: &[u8] = include_bytes!("../assets/icons/rustlandsweeper.ico");
+const LOGO_PNG: &[u8] = include_bytes!("../assets/icons/rustlandsweeper-256.png");
+
+async fn favicon() -> Response {
+    ([(header::CONTENT_TYPE, "image/x-icon"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON).into_response()
+}
+
+async fn logo() -> Response {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], LOGO_PNG).into_response()
 }
 
 fn suggested_subnet() -> String {
