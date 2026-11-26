@@ -80,6 +80,8 @@ pub struct ScanOptions {
     pub timeout: Duration,
     pub snmp_communities: Vec<String>,
     pub ping: bool,
+    /// Credentialed Windows inventory after discovery (None = off). On by default on Windows.
+    pub inventory: Option<crate::inventory::InventoryOptions>,
 }
 
 impl Default for ScanOptions {
@@ -90,6 +92,7 @@ impl Default for ScanOptions {
             timeout: Duration::from_millis(800),
             snmp_communities: vec!["public".into()],
             ping: true,
+            inventory: crate::inventory::supported().then(crate::inventory::InventoryOptions::default),
         }
     }
 }
@@ -100,6 +103,9 @@ pub struct Progress {
     pub total: AtomicUsize,
     pub done: AtomicUsize,
     pub up: AtomicUsize,
+    /// Windows devices queued for credentialed inventory after discovery, and how many are done.
+    pub inventory_total: AtomicUsize,
+    pub inventory_done: AtomicUsize,
     pub finished: AtomicBool,
 }
 
@@ -278,6 +284,21 @@ pub async fn execute_scan(
     let scanned: HashSet<String> = ips.iter().map(|ip| ip.to_string()).collect();
     db.mark_offline(scan_id, &scanned, &seen_ids)?;
     db.reassign_sites()?; // place new / moved assets into their sites
+
+    if let Some(inv_opts) = &opts.inventory {
+        let candidates: Vec<_> = seen_ids
+            .iter()
+            .filter_map(|id| db.get_asset(*id).ok().flatten())
+            .filter(crate::inventory::is_candidate)
+            .collect();
+        if !candidates.is_empty() {
+            progress.inventory_total.store(candidates.len(), Ordering::Relaxed);
+            let outcomes = crate::inventory::inventory_many(db.clone(), candidates, inv_opts.clone()).await;
+            progress.inventory_done.store(outcomes.len(), Ordering::Relaxed);
+            let ok = outcomes.iter().filter(|o| o.ok).count();
+            tracing::info!(scan = scan_id, ok, failed = outcomes.len() - ok, "windows inventory finished");
+        }
+    }
     db.finish_scan(scan_id, "completed", ips.len(), results.len(), new_assets, None)?;
     progress.finished.store(true, Ordering::Relaxed);
     Ok(())

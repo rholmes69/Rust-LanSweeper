@@ -84,6 +84,9 @@ pub fn router(state: AppState) -> Router {
         .route("/custom-fields", get(custom_fields_page).post(add_custom_field))
         .route("/custom-fields/{id}/delete", post(delete_custom_field))
         .route("/api/import", post(api_import))
+        .route("/assets/{id}/inventory", post(inventory_now))
+        .route("/credentials", get(credentials_page).post(add_credential))
+        .route("/credentials/{id}/delete", post(delete_credential))
         .route("/assets/{id}/delete", post(delete_asset))
         .route("/assets/{id}/site", post(set_asset_site))
         .route("/sites", get(sites_page).post(add_site))
@@ -216,7 +219,7 @@ tr:hover td{background:#fafbfc}td.mono,.mono{font-family:ui-monospace,Consolas,m
 .pill.ok{background:#dcfce7;color:var(--ok)}.pill.bad{background:#fee2e2;color:var(--bad)}.pill.run{background:#fef3c7;color:var(--run)}
 .bar{display:flex;align-items:center;gap:10px;margin:6px 0}.bar .lbl{width:190px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bar .trk{flex:1;background:#eef2f7;border-radius:4px;height:10px}.bar .fill{background:var(--accent);height:10px;border-radius:4px}.bar .v{width:36px;text-align:right;color:var(--muted)}
-form.inline{display:inline}input[type=text],input[type=number],select,textarea{border:1px solid var(--line);border-radius:6px;padding:7px 10px;font:inherit;background:#fff}
+form.inline{display:inline}input[type=text],input[type=number],input[type=password],input[type=date],select,textarea{border:1px solid var(--line);border-radius:6px;padding:7px 10px;font:inherit;background:#fff}
 textarea{width:100%;min-height:90px}button,.btn{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:7px 14px;font:inherit;font-weight:600;cursor:pointer}
 button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}button.danger{background:#fff;color:var(--bad);border:1px solid #fecaca}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.spacer{flex:1}
@@ -231,7 +234,7 @@ fn page(title: &str, active: &str, body: String) -> Html<String> {
 
 fn page_ext(title: &str, active: &str, body: String, head_extra: &str) -> Html<String> {
     let nav = [("dashboard", "/", "Dashboard"), ("assets", "/assets", "Assets"), ("sites", "/sites", "Sites"), ("scans", "/scans", "Scans"),
-        ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes"), ("ai", "/ai-access", "AI access")]
+        ("schedules", "/schedules", "Schedules"), ("changes", "/changes", "Changes"), ("credentials", "/credentials", "Credentials"), ("ai", "/ai-access", "AI access")]
         .iter()
         .map(|(k, href, label)| {
             format!("<a href='{href}' class='{}'>{label}</a>", if *k == active { "active" } else { "" })
@@ -505,10 +508,12 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
     let body = format!(
         "<div class=row><h1>{name}</h1>&nbsp;{status}<div class=spacer></div>\
            <form class=inline method=post action='/scans'><input type=hidden name=targets value='{ip}'><button class=ghost>Rescan</button></form>\
+           <form class=inline method=post action='/assets/{id}/inventory'><button class=ghost>Inventory now</button></form>\
            <form class=inline method=post action='/assets/{id}/delete' onsubmit=\"return confirm('Delete this asset and its history?')\"><button class=danger>Delete</button></form></div>\
          <div class='grid g3'>\
           <div>\
            <div class=card><h2>Identity</h2><dl>{identity}</dl></div>\
+           {windows_card}\
            <div class=card><h2>Open ports ({nports})</h2><table><tr><th>Port</th><th>Service</th><th>Banner</th></tr>{port_rows}</table></div>\
            <div class=card><h2>History</h2>{history}</div>\
           </div>\
@@ -556,6 +561,7 @@ async fn asset_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResul
         ]
         .concat(),
         web = [row("Server", opt(&a.http_server)), row("Title", opt(&a.http_title))].concat(),
+        windows_card = windows_card(&a, st.db.windows_inventory(a.id)?),
         details_form = details_form(&a, &st.db.custom_fields()?, &st.db.asset_custom_values(a.id)?),
         site_opts = std::iter::once(format!("<option value=''{}>Automatic (by subnet)</option>", if a.site_manual { "" } else { " selected" }))
             .chain(st.db.list_sites()?.iter().map(|x| format!(
@@ -842,9 +848,13 @@ async fn scan_page(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult
             (
                 format!(
                     "<div class=card><h2>Progress</h2><div class=progress><div style='width:{}%'></div></div>\
-                     <p>{done} / {total} hosts probed · <b>{}</b> up so far</p><p class=hint>This page refreshes automatically.</p></div>",
+                     <p>{done} / {total} hosts probed · <b>{}</b> up so far{}</p><p class=hint>This page refreshes automatically.</p></div>",
                     done * 100 / total,
-                    p.up.load(Ordering::Relaxed)
+                    p.up.load(Ordering::Relaxed),
+                    match p.inventory_total.load(Ordering::Relaxed) {
+                        0 => String::new(),
+                        n => format!(" · Windows inventory of {n} device(s) in progress"),
+                    }
                 ),
                 "<meta http-equiv=refresh content=2>",
             )
@@ -1128,6 +1138,197 @@ async fn api_sites(State(st): State<AppState>) -> WebResult<Json<serde_json::Val
     Ok(Json(json!(st.db.list_sites()?)))
 }
 
+// ---------------------------------------------------------------- Windows inventory & credentials
+
+fn gb(bytes: Option<u64>) -> String {
+    bytes.map(|b| format!("{:.0} GB", b as f64 / 1_073_741_824.0)).unwrap_or_else(|| "—".into())
+}
+
+fn windows_card(a: &Asset, inv: Option<serde_json::Value>) -> String {
+    let status = match (a.inventory_status.as_deref(), &a.inventory_error) {
+        (Some("error"), Some(e)) => format!(
+            "<p style='color:var(--bad)'>Last attempt failed ({}): {}</p>",
+            esc(a.inventory_at.as_deref().unwrap_or("")), esc(e)
+        ),
+        _ => String::new(),
+    };
+    let Some(w) = inv else {
+        if status.is_empty() {
+            return String::new();
+        }
+        return format!("<div class=card><h2>Windows inventory</h2>{status}<p class=hint>Check <a href=/credentials>credentials</a>, then use Inventory now.</p></div>");
+    };
+    let t = |k: &str| w.get(k).and_then(|v| v.as_str()).map(esc).unwrap_or_else(|| "<span class=muted>—</span>".into());
+    let n = |k: &str| w.get(k).and_then(|v| v.as_i64());
+    let row = |k: &str, v: String| format!("<dt>{k}</dt><dd>{v}</dd>");
+    let disks: String = w
+        .get("disks")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|d| {
+                    let size = d.get("size_bytes").and_then(|v| v.as_u64());
+                    let free = d.get("free_bytes").and_then(|v| v.as_u64());
+                    let pct = match (size, free) {
+                        (Some(s), Some(f)) if s > 0 => f as f64 / s as f64 * 100.0,
+                        _ => 100.0,
+                    };
+                    format!(
+                        "<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td{}>{} ({pct:.0}% free)</td></tr>",
+                        esc(d.get("drive").and_then(|v| v.as_str()).unwrap_or("?")),
+                        esc(d.get("filesystem").and_then(|v| v.as_str()).unwrap_or("")),
+                        gb(size),
+                        if pct < 10.0 { " style='color:var(--bad);font-weight:600'" } else { "" },
+                        gb(free)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let nics: String = w
+        .get("nics")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|n| {
+                    let ips = n.get("ips").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                    format!(
+                        "<tr><td>{}</td><td class=mono>{}</td><td class=mono>{}</td></tr>",
+                        esc(n.get("description").and_then(|v| v.as_str()).unwrap_or("")),
+                        esc(n.get("mac").and_then(|v| v.as_str()).unwrap_or("")),
+                        esc(&ips)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "<div class=card><h2>Windows inventory <span class=muted style='font-weight:400'>· {} via {}</span></h2>{status}\
+         <div class='grid g2' style='gap:8px 24px'><dl>{}</dl><dl>{}</dl></div>\
+         <h2 style='margin-top:14px'>Disks</h2><table><tr><th>Drive</th><th>FS</th><th>Size</th><th>Free</th></tr>{}</table>\
+         <h2 style='margin-top:14px'>Network adapters</h2><table><tr><th>Adapter</th><th>MAC</th><th>IPs</th></tr>{}</table></div>",
+        t("collected_at"), t("credential"),
+        [
+            row("Computer", format!("{} <span class=muted>{}</span>", t("computer_name"), t("domain"))),
+            row("OS", t("os_name")),
+            row("Version / build", format!("{} / {}", t("os_version"), t("os_build"))),
+            row("Architecture", t("os_arch")),
+            row("Installed", t("os_install_date")),
+            row("Last boot", t("last_boot")),
+            row("Logged-on user", t("last_user")),
+        ].concat(),
+        [
+            row("Manufacturer", t("manufacturer")),
+            row("Model", t("model")),
+            row("Serial", format!("<span class=mono>{}</span>", t("serial_number"))),
+            row("BIOS", format!("{} <span class=muted>{}</span>", t("bios_version"), t("bios_date"))),
+            row("CPU", format!("{} <span class=muted>({} cores / {} threads)</span>", t("cpu"),
+                n("cores").map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                n("logical_processors").map(|c| c.to_string()).unwrap_or_else(|| "?".into()))),
+            row("Memory", n("memory_mb").map(|m| format!("{:.1} GB", m as f64 / 1024.0)).unwrap_or_else(|| "—".into())),
+        ].concat(),
+        if disks.is_empty() { "<tr><td colspan=4 class=muted>None reported</td></tr>".into() } else { disks },
+        if nics.is_empty() { "<tr><td colspan=3 class=muted>None reported</td></tr>".into() } else { nics },
+    )
+}
+
+async fn inventory_now(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Response> {
+    let Some(a) = st.db.get_asset(id)? else { return Ok(not_found()) };
+    if !crate::inventory::supported() {
+        return Ok(form_error("Inventory unavailable", "assets",
+            &anyhow::anyhow!("Windows inventory needs RustSweeper running on Windows (it uses Windows PowerShell and WMI)."), &format!("/assets/{id}")));
+    }
+    let opts = st.opts.inventory.clone().unwrap_or_default();
+    let db = st.db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::inventory::inventory_asset(&db, &a, &opts).await {
+            tracing::warn!(asset = a.id, "inventory failed: {e:#}");
+        }
+    });
+    Ok(page_ext("Inventory running", "assets", format!(
+        "<h1>Inventory started</h1><div class=card><p>Collecting Windows details for this device — this usually takes 5–30 seconds.</p>\
+         <p><a href='/assets/{id}'>Back to the asset</a> (refresh it in a moment).</p></div>"
+    ), &format!("<meta http-equiv=refresh content='12;url=/assets/{id}'>")).into_response())
+}
+
+async fn credentials_page(State(st): State<AppState>) -> WebResult<Html<String>> {
+    let creds = st.db.list_credentials()?;
+    let sites = st.db.list_sites()?;
+    let rows: String = creds
+        .iter()
+        .map(|c| format!(
+            "<tr><td>{}</td><td class=mono>{}</td><td>{}</td><td class=muted>{}</td><td class=muted>{}</td>\
+             <td><form class=inline method=post action='/credentials/{}/delete' onsubmit=\"return confirm('Delete this credential?')\"><button class=danger>Delete</button></form></td></tr>",
+            esc(&c.name), esc(&c.username), c.site.as_deref().map(esc).unwrap_or_else(|| "All sites".into()),
+            esc(&c.created_at), opt(&c.last_success), c.id
+        ))
+        .collect();
+    let issues: String = st
+        .db
+        .inventory_issues(200)?
+        .iter()
+        .map(|i| format!(
+            "<tr><td><a href='/assets/{}'>{}</a></td><td class=mono>{}</td><td>{}</td><td class=muted style='white-space:nowrap'>{}</td><td style='color:var(--bad)'>{}</td></tr>",
+            i.asset_id, esc(&i.name), esc(&i.ip), opt(&i.site), opt(&i.at), esc(&i.error)
+        ))
+        .collect();
+    let mode = if crate::inventory::supported() {
+        match &st.opts.inventory {
+            Some(o) => format!("Windows inventory runs after every scan over <b>{}</b>{}.", esc(&o.protocol),
+                if o.integrated_auth { ", trying stored credentials first and then the account RustSweeper runs as" } else { " using stored credentials only" }),
+            None => "Windows inventory is <b>off</b> (started with --no-inventory). You can still use Inventory now on an asset.".into(),
+        }
+    } else {
+        "<span style='color:var(--bad)'>This server isn't running on Windows, so credentialed Windows inventory is unavailable.</span>".into()
+    };
+    Ok(page("Credentials", "credentials", format!(
+        "<h1>Credentials</h1>\
+         <div class=card><p>{mode}</p><p class=hint>Use an account that is a local administrator on the PCs (typically a dedicated domain account added via Group Policy). \
+         Passwords are encrypted with Windows DPAPI on this server and never shown again. Targets need WMI/DCOM reachable (TCP 135 + dynamic RPC) — \
+         the \"Windows Management Instrumentation\" firewall rule group.</p></div>\
+         <div class=card><h2>Add credential</h2><form method=post action=/credentials class=row autocomplete=off>\
+           <input type=text name=name placeholder='Name (e.g. Domain scanning)' required>\
+           <input type=text name=username placeholder='DELTA\\svc-rustsweeper' required>\
+           <input type=password name=password placeholder='Password' required autocomplete=new-password>\
+           <select name=site_id><option value=''>All sites</option>{}</select><button>Save</button></form></div>\
+         <div class=card style='padding:0'><table><tr><th>Name</th><th>User</th><th>Applies to</th><th>Added</th><th>Last success</th><th></th></tr>{}</table></div>\
+         <div class=card style='padding:0;overflow-x:auto'><h2 style='padding:16px 16px 0'>Inventory problems</h2>\
+           <table><tr><th>Asset</th><th>IP</th><th>Site</th><th>When</th><th>Error</th></tr>{}</table></div>",
+        sites.iter().map(|x| format!("<option value='{}'>{}</option>", x.id, esc(&x.name))).collect::<String>(),
+        if rows.is_empty() { "<tr><td colspan=6 class=muted>No stored credentials</td></tr>".into() } else { rows },
+        if issues.is_empty() { "<tr><td colspan=5 class=muted>No problems</td></tr>".into() } else { issues },
+    )))
+}
+
+#[derive(Deserialize)]
+struct CredentialForm {
+    name: String,
+    username: String,
+    password: String,
+    #[serde(default)]
+    site_id: String,
+}
+
+async fn add_credential(State(st): State<AppState>, Form(f): Form<CredentialForm>) -> WebResult<Response> {
+    let res = async {
+        if f.password.is_empty() {
+            anyhow::bail!("password is required");
+        }
+        let secret = crate::inventory::protect_secret(&f.password).await?;
+        st.db.add_credential(&f.name, &f.username, &secret, f.site_id.trim().parse().ok())
+    }
+    .await;
+    Ok(match res {
+        Ok(_) => Redirect::to("/credentials").into_response(),
+        Err(e) => form_error("Could not save credential", "credentials", &e, "/credentials"),
+    })
+}
+
+async fn delete_credential(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult<Redirect> {
+    st.db.delete_credential(id)?;
+    Ok(Redirect::to("/credentials"))
+}
+
 // ---------------------------------------------------------------- CSV export
 
 fn csv_field(s: &str) -> String {
@@ -1192,6 +1393,7 @@ async fn api_asset(State(st): State<AppState>, Path(id): Path<i64>) -> WebResult
     Ok(Json(json!({
         "asset": a,
         "custom_fields": st.db.asset_custom_values(id)?.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        "windows_inventory": st.db.windows_inventory(id)?,
         "ports": st.db.asset_ports(id)?,
         "changes": st.db.changes(Some(id), 200)?,
     })).into_response())

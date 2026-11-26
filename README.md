@@ -34,6 +34,9 @@ Medical (HL7 2575 / DICOM 104), Apple Device, Raspberry Pi, and virtual machines
   **custom fields**; edit on the asset page, via CLI/API, or in bulk with **CSV import**
 - **Manual assets** for devices the scanner can't reach (off-site laptops, spare stock)
 - **Scan visibility**: where each record came from and how the scanner last detected it
+- **Windows inventory** (when running on Windows): logs in over WMI to collect manufacturer, model,
+  serial, BIOS, CPU, RAM, disks, network adapters, OS edition/build, install date, last boot and the
+  logged-on user; stored credentials are DPAPI-encrypted; failures are listed as inventory problems
 - **Scheduled scans** (hourly / daily / weekly …) that run while the server is up
 - **REST API** for scripting and integrations
 - Optional **HTTP basic auth**; listens on localhost only by default
@@ -75,6 +78,36 @@ rustsweeper add --name LAPTOP-0142 --mac AA-BB-CC-00-11-22
 rustsweeper import inventory.csv --dry-run
 rustsweeper import inventory.csv --create
 ```
+
+## Windows inventory (credentialed)
+
+When RustSweeper runs **on Windows**, every scan is followed by a credentialed inventory of the
+Windows devices it found, the way Lansweeper does it: a WMI/CIM session over DCOM (or WinRM with
+`--inventory-protocol wsman`) reads hardware, OS and the logged-on user. Results appear in a
+**Windows inventory** card on each asset, feed the asset's manufacturer/model/serial when those are
+blank (never overwriting what you entered), set an exact OS and Server/Workstation type, and are
+queryable by AI assistants (Windows 10 end-of-support, low disk, low RAM, not rebooted, who's logged
+on where…). Hardware and OS changes are recorded in the asset's history.
+
+**Credentials.** Use an account that is a local administrator on your PCs — usually a dedicated
+domain account (e.g. `DELTA\svc-rustsweeper`) added to local Administrators by Group Policy. Add it
+on the **Credentials** page or:
+
+```sh
+rustsweeper credential add "Domain scanning" --user DELTA\svc-rustsweeper     # prompts for the password
+rustsweeper credential add "Dental local admin" --user .\Administrator --site Dental
+rustsweeper inventory 10.10.0.25        # one device now; or --site Dental / --all
+```
+
+Passwords are encrypted with Windows DPAPI (machine scope) on the RustSweeper server and are
+only passed to the PowerShell collector through its environment — never on a command line or in
+logs. RustSweeper tries the credential that worked last time, then site-specific ones, then global
+ones, then the account the service runs as (`--no-integrated-auth` to skip that). Devices that fail
+show up under **Inventory problems** with the reason.
+
+**Target requirements.** WMI must be reachable: allow the *Windows Management Instrumentation
+(WMI-In / DCOM-In)* firewall rule group (TCP 135 + dynamic RPC) for the RustSweeper server's
+address, e.g. via GPO. Use `--no-inventory` to turn it off.
 
 ## Usage
 
@@ -244,7 +277,8 @@ nssm start RustSweeper
 - Per-scan limit is 65,536 addresses (a /16).
 - Basic auth sends credentials in clear text; put it behind HTTPS (IIS/nginx reverse proxy)
   if it's reachable beyond the IT VLAN.
-- This version is agentless and doesn't log in to devices. Credentialed inventory (installed software,
+- Credentialed inventory currently covers Windows hardware/OS/user; installed software, services
+  and patches come next. Credentialed inventory (installed software,
   hardware specs via WMI/WinRM, SSH) or an endpoint agent are natural next steps.
 
 ## Project layout
@@ -264,6 +298,9 @@ src/
   auth.rs              API tokens for /mcp (optionally site-scoped)
   sites.rs             site subnets and longest-prefix assignment
   import.rs            CSV import (matching, preview, custom fields)
+  inventory/
+    mod.rs             credentialed Windows inventory (credential order, storage)
+    collect.ps1        PowerShell/CIM collector run on the RustSweeper host
   scanner/
     mod.rs             scan orchestration
     targets.rs         CIDR / range / hostname parsing

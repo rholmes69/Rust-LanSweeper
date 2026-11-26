@@ -3,6 +3,7 @@
 mod auth;
 mod db;
 mod import;
+mod inventory;
 mod mcp;
 mod query;
 mod scanner;
@@ -51,6 +52,15 @@ struct ScanArgs {
     /// Skip ICMP ping (use TCP/UDP probes only).
     #[arg(long)]
     no_ping: bool,
+    /// Don't run credentialed Windows inventory after discovery.
+    #[arg(long)]
+    no_inventory: bool,
+    /// WMI transport for Windows inventory: dcom (default) or wsman.
+    #[arg(long, default_value = "dcom", value_parser = ["dcom", "wsman"])]
+    inventory_protocol: String,
+    /// Don't try the service's own Windows account when no stored credential works.
+    #[arg(long)]
+    no_integrated_auth: bool,
 }
 
 impl ScanArgs {
@@ -64,6 +74,12 @@ impl ScanArgs {
         };
         if let Some(p) = &self.ports {
             o.ports = p.clone();
+        }
+        if self.no_inventory {
+            o.inventory = None;
+        } else if let Some(inv) = &mut o.inventory {
+            inv.protocol = if self.inventory_protocol == "wsman" { "Wsman".into() } else { "Dcom".into() };
+            inv.integrated_auth = !self.no_integrated_auth;
         }
         o
     }
@@ -154,6 +170,26 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Manage stored Windows credentials used for inventory (passwords are DPAPI-encrypted).
+    Credential {
+        #[command(subcommand)]
+        action: CredentialCmd,
+    },
+    /// Run credentialed Windows inventory now (Windows only).
+    Inventory {
+        /// Asset id, IP, MAC or name. Omit with --site or --all.
+        asset: Option<String>,
+        /// All Windows-looking assets in this site.
+        #[arg(long)]
+        site: Option<String>,
+        /// All Windows-looking assets.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "dcom", value_parser = ["dcom", "wsman"])]
+        protocol: String,
+        #[arg(long)]
+        no_integrated_auth: bool,
+    },
     /// Manage custom asset fields.
     Field {
         #[command(subcommand)]
@@ -197,6 +233,22 @@ enum TokenCmd {
     List,
     /// Revoke by id or name. Active sessions using it stop working immediately.
     Revoke { id_or_name: String },
+}
+
+#[derive(Subcommand)]
+enum CredentialCmd {
+    /// Add a credential; you'll be prompted for the password.
+    Add {
+        name: String,
+        /// DOMAIN\user or user@domain (local accounts: .\Administrator).
+        #[arg(long)]
+        user: String,
+        /// Only use for assets in this site.
+        #[arg(long)]
+        site: Option<String>,
+    },
+    List,
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -392,6 +444,60 @@ async fn main() -> Result<()> {
                     if x.errors.is_empty() { String::new() } else { format!("  !! {}", x.errors.join("; ")) }
                 );
             }
+        }
+        Cmd::Credential { action } => match action {
+            CredentialCmd::Add { name, user, site } => {
+                let site_id = match &site {
+                    Some(s) => Some(db.find_site(s)?.with_context(|| format!("no site '{s}'"))?.id),
+                    None => None,
+                };
+                let pw = rpassword::prompt_password(format!("Password for {user}: "))?;
+                if pw.is_empty() {
+                    bail!("empty password");
+                }
+                let secret = inventory::protect_secret(&pw).await?;
+                let id = db.add_credential(&name, &user, &secret, site_id)?;
+                println!("Credential #{id} '{name}' saved (password encrypted with Windows DPAPI on this machine).");
+            }
+            CredentialCmd::List => {
+                println!("{:<4} {:<20} {:<30} {:<16} LAST SUCCESS", "ID", "NAME", "USER", "SITE");
+                for c in db.list_credentials()? {
+                    println!("{:<4} {:<20} {:<30} {:<16} {}", c.id, trunc(&c.name, 20), trunc(&c.username, 30),
+                        c.site.as_deref().unwrap_or("all sites"), c.last_success.as_deref().unwrap_or("never"));
+                }
+            }
+            CredentialCmd::Remove { name } => {
+                let c = db.list_credentials()?.into_iter().find(|c| c.name.eq_ignore_ascii_case(&name) || c.id.to_string() == name)
+                    .with_context(|| format!("no credential '{name}'"))?;
+                db.delete_credential(c.id)?;
+                println!("Removed credential '{}'", c.name);
+            }
+        },
+        Cmd::Inventory { asset, site, all, protocol, no_integrated_auth } => {
+            if !inventory::supported() {
+                bail!("Windows inventory needs RustSweeper running on Windows");
+            }
+            let assets = match (asset, site, all) {
+                (Some(a), _, _) => vec![find_asset(&db, &a)?],
+                (None, Some(s), _) => {
+                    let id = db.find_site(&s)?.with_context(|| format!("no site '{s}'"))?.id;
+                    db.list_assets(&AssetFilter { site_id: Some(id), ..Default::default() })?.into_iter().filter(inventory::is_candidate).collect()
+                }
+                (None, None, true) => db.list_assets(&AssetFilter::default())?.into_iter().filter(inventory::is_candidate).collect(),
+                _ => bail!("give an asset, --site NAME or --all"),
+            };
+            println!("Inventorying {} device(s)…", assets.len());
+            let opts = inventory::InventoryOptions {
+                protocol: if protocol == "wsman" { "Wsman".into() } else { "Dcom".into() },
+                integrated_auth: !no_integrated_auth,
+                ..Default::default()
+            };
+            let outcomes = inventory::inventory_many(db.clone(), assets, opts).await;
+            for o in &outcomes {
+                println!("  {} {:<24} {}{}", if o.ok { "ok  " } else { "FAIL" }, trunc(&o.name, 24), o.message,
+                    o.credential.as_ref().map(|c| format!("  [{c}]")).unwrap_or_default());
+            }
+            println!("{} ok, {} failed", outcomes.iter().filter(|o| o.ok).count(), outcomes.iter().filter(|o| !o.ok).count());
         }
         Cmd::Field { action } => match action {
             FieldCmd::Add { name } => {
