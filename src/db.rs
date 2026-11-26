@@ -165,6 +165,31 @@ CREATE TABLE IF NOT EXISTS windows_inventory (
     nics                TEXT
 );
 
+CREATE TABLE IF NOT EXISTS software (
+    asset_id      INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    product       TEXT NOT NULL,
+    version       TEXT,
+    publisher     TEXT,
+    install_date  TEXT,
+    arch          TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (asset_id, name, arch)
+);
+CREATE INDEX IF NOT EXISTS idx_software_product ON software(product);
+
+CREATE TABLE IF NOT EXISTS services (
+    asset_id        INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    display_name    TEXT,
+    state           TEXT,
+    start_mode      TEXT,
+    start_name      TEXT,
+    path            TEXT,
+    unquoted_path   INTEGER NOT NULL DEFAULT 0,
+    custom_account  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (asset_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL,
@@ -496,6 +521,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("assets", "inventory_error", "TEXT"),
     ("assets", "inventory_at", "TEXT"),
     ("assets", "inventory_credential_id", "INTEGER"),
+    // Phase 3b: software & services collection status
+    ("windows_inventory", "software_count", "INTEGER"),
+    ("windows_inventory", "software_error", "TEXT"),
+    ("windows_inventory", "services_error", "TEXT"),
 ];
 
 /// SQL expression for an asset's display name (alias `a`). Keep in sync with `Asset::display_name`.
@@ -1376,6 +1405,77 @@ impl Db {
                 inv.min_free_pct(), serde_json::to_string(&inv.disks)?, serde_json::to_string(&inv.nics)?,
             ],
         )?;
+        // Software: replace the set, logging installs/removals/upgrades (not on the first collection).
+        if inv.software_error.is_none() {
+            let had: std::collections::HashMap<(String, String), Option<String>> = {
+                let mut st = tx.prepare("SELECT name, arch, version FROM software WHERE asset_id=?1")?;
+                let rows = st.query_map([asset_id], |r| Ok(((r.get::<_, String>(0)?, r.get::<_, String>(1)?), r.get::<_, Option<String>>(2)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let first = had.is_empty();
+            let label = |n: &str, v: &Option<String>| format!("{n}{}", v.as_deref().map(|v| format!(" {v}")).unwrap_or_default());
+            let mut now_keys = std::collections::HashSet::new();
+            for sw in &inv.software {
+                let arch = sw.arch.clone().unwrap_or_default();
+                now_keys.insert((sw.name.clone(), arch.clone()));
+                if !first {
+                    match had.get(&(sw.name.clone(), arch.clone())) {
+                        None => { tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'software installed',NULL,?3)", params![asset_id, ts, label(&sw.name, &sw.version)])?; }
+                        Some(v) if *v != sw.version => { tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'software updated',?3,?4)", params![asset_id, ts, label(&sw.name, v), label(&sw.name, &sw.version)])?; }
+                        _ => {}
+                    }
+                }
+            }
+            if !first {
+                for ((name, arch), v) in &had {
+                    if !now_keys.contains(&(name.clone(), arch.clone())) {
+                        tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'software removed',?3,NULL)", params![asset_id, ts, label(name, v)])?;
+                    }
+                }
+            }
+            tx.execute("DELETE FROM software WHERE asset_id=?1", [asset_id])?;
+            for sw in &inv.software {
+                tx.execute(
+                    "INSERT OR REPLACE INTO software (asset_id, name, product, version, publisher, install_date, arch) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![asset_id, sw.name, crate::inventory::normalize_product(&sw.name), sw.version,
+                        sw.publisher.as_deref().map(crate::inventory::normalize_publisher), sw.install_date_iso(), sw.arch.clone().unwrap_or_default()],
+                )?;
+            }
+        }
+        // Services: replace the set, logging added/removed services and start-mode changes.
+        if inv.services_error.is_none() {
+            let had: std::collections::HashMap<String, Option<String>> = {
+                let mut st = tx.prepare("SELECT name, start_mode FROM services WHERE asset_id=?1")?;
+                let rows = st.query_map([asset_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let first = had.is_empty();
+            let now_names: std::collections::HashSet<&str> = inv.services.iter().map(|s| s.name.as_str()).collect();
+            if !first {
+                for sv in &inv.services {
+                    match had.get(&sv.name) {
+                        None => { tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'service added',NULL,?3)", params![asset_id, ts, sv.name])?; }
+                        Some(m) if *m != sv.start_mode => { tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'service start mode',?3,?4)", params![asset_id, ts,
+                            format!("{}: {}", sv.name, m.as_deref().unwrap_or("?")), format!("{}: {}", sv.name, sv.start_mode.as_deref().unwrap_or("?"))])?; }
+                        _ => {}
+                    }
+                }
+                for name in had.keys().filter(|n| !now_names.contains(n.as_str())) {
+                    tx.execute("INSERT INTO changes (asset_id, scan_id, at, field, old_value, new_value) VALUES (?1,NULL,?2,'service removed',?3,NULL)", params![asset_id, ts, name])?;
+                }
+            }
+            tx.execute("DELETE FROM services WHERE asset_id=?1", [asset_id])?;
+            for sv in &inv.services {
+                tx.execute(
+                    "INSERT OR REPLACE INTO services (asset_id, name, display_name, state, start_mode, start_name, path, unquoted_path, custom_account) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![asset_id, sv.name, sv.display_name, sv.state, sv.start_mode, sv.start_name, sv.path, sv.unquoted_path() as i64, sv.custom_account() as i64],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE windows_inventory SET software_count = (SELECT COUNT(*) FROM software WHERE asset_id=?1), software_error=?2, services_error=?3 WHERE asset_id=?1",
+            params![asset_id, inv.software_error, inv.services_error],
+        )?;
         // Fill blanks only — IT-entered values win.
         for (col, val) in [("manufacturer", inv.manufacturer.clone()), ("model", inv.model.clone()), ("serial_number", serial)] {
             if let Some(v) = val.filter(|v| !v.trim().is_empty()) {
@@ -1428,6 +1528,53 @@ impl Db {
             })
             .optional()?;
         Ok(row)
+    }
+
+    pub fn asset_software(&self, asset_id: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.lock();
+        let mut st = conn.prepare("SELECT name, version, publisher, install_date, arch FROM software WHERE asset_id=?1 ORDER BY name COLLATE NOCASE")?;
+        let rows = st.query_map([asset_id], |r| {
+            Ok(serde_json::json!({"name": r.get::<_, String>(0)?, "version": r.get::<_, Option<String>>(1)?, "publisher": r.get::<_, Option<String>>(2)?,
+                "install_date": r.get::<_, Option<String>>(3)?, "arch": r.get::<_, String>(4)?}))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn asset_services(&self, asset_id: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT name, display_name, state, start_mode, start_name, path, unquoted_path, custom_account FROM services WHERE asset_id=?1 \
+             ORDER BY CASE WHEN start_mode='Auto' AND state<>'Running' THEN 0 ELSE 1 END, display_name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map([asset_id], |r| {
+            Ok(serde_json::json!({"name": r.get::<_, String>(0)?, "display_name": r.get::<_, Option<String>>(1)?, "state": r.get::<_, Option<String>>(2)?,
+                "start_mode": r.get::<_, Option<String>>(3)?, "start_name": r.get::<_, Option<String>>(4)?, "path": r.get::<_, Option<String>>(5)?,
+                "unquoted_path": r.get::<_, i64>(6)? != 0, "custom_account": r.get::<_, i64>(7)? != 0}))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Fleet-wide software summary: (product, publisher, installs, distinct versions), filtered by text.
+    pub fn software_summary(&self, q: Option<&str>, limit: i64) -> Result<Vec<(String, Option<String>, i64, i64)>> {
+        let conn = self.lock();
+        let like = format!("%{}%", q.unwrap_or("").trim());
+        let mut st = conn.prepare(
+            "SELECT product, MAX(publisher), COUNT(DISTINCT asset_id), COUNT(DISTINCT COALESCE(version,'')) FROM software \
+             WHERE product LIKE ?1 OR publisher LIKE ?1 GROUP BY product ORDER BY 3 DESC, product COLLATE NOCASE LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![like, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Devices with a given product installed: (asset id, display name, ip, site, version).
+    pub fn software_installs(&self, product: &str) -> Result<Vec<(i64, String, String, Option<String>, Option<String>)>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT a.id, {NAME_SQL}, a.ip, (SELECT st.name FROM sites st WHERE st.id=a.site_id), s.version \
+             FROM software s JOIN assets a ON a.id=s.asset_id WHERE s.product=?1 ORDER BY s.version DESC, a.ip_num"
+        ))?;
+        let rows = st.query_map([product], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Assets whose last inventory attempt failed ("scanning issues").

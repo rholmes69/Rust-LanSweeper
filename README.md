@@ -36,7 +36,9 @@ Medical (HL7 2575 / DICOM 104), Apple Device, Raspberry Pi, and virtual machines
 - **Scan visibility**: where each record came from and how the scanner last detected it
 - **Windows inventory** (when running on Windows): logs in over WMI to collect manufacturer, model,
   serial, BIOS, CPU, RAM, disks, network adapters, OS edition/build, install date, last boot and the
-  logged-on user; stored credentials are DPAPI-encrypted; failures are listed as inventory problems
+  logged-on user, **installed software** and **Windows services**; stored credentials are
+  DPAPI-encrypted; failures are listed as inventory problems
+- **Software** page: every product across the fleet with device and version counts
 - **Scheduled scans** (hourly / daily / weekly …) that run while the server is up
 - **REST API** for scripting and integrations
 - Optional **HTTP basic auth**; listens on localhost only by default
@@ -88,6 +90,16 @@ Windows devices it found, the way Lansweeper does it: a WMI/CIM session over DCO
 blank (never overwriting what you entered), set an exact OS and Server/Workstation type, and are
 queryable by AI assistants (Windows 10 end-of-support, low disk, low RAM, not rebooted, who's logged
 on where…). Hardware and OS changes are recorded in the asset's history.
+
+**Software and services.** Installed programs are read from each device's registry *Uninstall*
+keys (64- and 32-bit) through WMI's `StdRegProv` — not `Win32_Product`, which makes Windows Installer
+re-check every MSI package. Names are normalised (versions and `(x64 en-US)`-style tags removed) so
+the **Software** page can show how many devices run each product and how many versions are in use.
+Windows services are recorded with state, start mode and the account they run as, flagging
+unquoted executable paths and services running under user accounts. Installs, removals, upgrades,
+new/removed services and start-mode changes go into the asset's history. AI assistants get the
+`software` and `services` datasets plus catalog queries such as *remote-access tools installed*,
+*end-of-life software*, *automatic services that aren't running* and *unquoted service paths*.
 
 **Credentials.** Use an account that is a local administrator on your PCs — usually a dedicated
 domain account (e.g. `DELTA\svc-rustsweeper`) added to local Administrators by Group Policy. Add it
@@ -277,8 +289,8 @@ nssm start RustSweeper
 - Per-scan limit is 65,536 addresses (a /16).
 - Basic auth sends credentials in clear text; put it behind HTTPS (IIS/nginx reverse proxy)
   if it's reachable beyond the IT VLAN.
-- Credentialed inventory currently covers Windows hardware/OS/user; installed software, services
-  and patches come next. Credentialed inventory (installed software,
+- Credentialed inventory covers Windows hardware, OS, user, software and services; patches,
+  antivirus/BitLocker status and Linux (SSH) come next. Credentialed inventory (installed software,
   hardware specs via WMI/WinRM, SSH) or an endpoint agent are natural next steps.
 
 ## Project layout
